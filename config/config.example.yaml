@@ -1,0 +1,116 @@
+# Reservation Agent Configuration
+# Copy this file to config.yaml and fill in your details
+
+# Email notifications (Gmail example)
+smtp:
+  host: "smtp.gmail.com"
+  port: 587
+  username: "your-email@gmail.com"
+  password: "${SMTP_PASSWORD}"  # Set SMTP_PASSWORD environment variable
+  to_addresses:
+    - "your-email@gmail.com"
+
+# Platform credentials
+# Use environment variables for passwords: ${RESY_PASSWORD}
+credentials:
+  - platform: "resy"
+    username: "your-email@example.com"
+    password: "${RESY_PASSWORD}"
+
+  - platform: "opentable"
+    username: "your-email@example.com"
+    password: "${OPENTABLE_PASSWORD}"
+
+  - platform: "tock"
+    username: "your-email@example.com"
+    password: "${TOCK_PASSWORD}"
+
+# Restaurants to monitor
+restaurants:
+  # Example: Carbone (Resy)
+  - name: "Carbone"
+    platform: "resy"
+    venue_id: "carbone-new-york"
+    party_size: 2
+    target_dates:
+      - "2026-03-15"
+      - "2026-03-16"
+    preferred_times:
+      - "19:00-20:00"
+      - "20:00-21:00"
+    release_time: "09:00"
+    release_days_ahead: 30
+    monitor_cancellations: true
+    enabled: true
+
+  # Example: Don Angie (Resy)
+  - name: "Don Angie"
+    platform: "resy"
+    venue_id: "don-angie-new-york"
+    party_size: 2
+    target_dates:
+      - "2026-03-15"
+    preferred_times:
+      - "18:30-19:30"
+      - "19:30-20:30"
+    release_time: "09:00"
+    release_days_ahead: 14
+    monitor_cancellations: true
+    enabled: true
+
+  # Musaafer NYC (OpenTable)
+  - name: "Musaafer"
+    platform: "opentable"
+    venue_id: "musaafer-new-york-new-york-city"
+    party_size: 2
+    target_dates:
+      - "2026-02-28"
+      - "2026-03-01"
+    preferred_times:
+      - "19:00-20:00"
+      - "20:00-21:00"
+      - "18:30-19:30"
+    release_time: "00:01"
+    release_days_ahead: 14
+    monitor_cancellations: true
+    enabled: true
+
+  # Example: Atomix (Tock - prepaid)
+  - name: "Atomix"
+    platform: "tock"
+    venue_id: "atomix"
+    party_size: 2
+    target_dates:
+      - "2026-04-01"
+    preferred_times:
+      - "17:30-18:30"
+      - "20:00-21:00"
+    release_time: "10:00"
+    release_days_ahead: 28
+    monitor_cancellations: true
+    enabled: false  # Disabled by default - requires payment method
+
+# Scheduler settings
+scheduler:
+  cancellation_poll_interval: 60  # seconds between cancellation checks
+  snipe_wake_before: 30  # seconds before release to wake up
+  snipe_rapid_poll_interval: 0.5  # seconds between rapid polls
+  snipe_duration: 10  # seconds to rapid poll after release
+  max_backoff: 300  # max seconds between retries on error
+
+# Browser settings
+browser:
+  headless: true  # Set to false for debugging
+  slow_mo: 0  # Add delay between actions (ms) for debugging
+  timeout: 30000  # Page load timeout (ms)
+  sessions_dir: "data/sessions"
+
+# Database
+database_url: "sqlite+aiosqlite:///data/reservation_agent.db"
+
+# Logging
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+log_dir: "data/logs"
+
+# Safety
+dry_run: false  # Set to true to test without actually booking
