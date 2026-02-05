@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/python3</string>
+        <string>/opt/anaconda3/bin/python</string>
         <string>-m</string>
         <string>reservation_agent</string>
         <string>--config</string>

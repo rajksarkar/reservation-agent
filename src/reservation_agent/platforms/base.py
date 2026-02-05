@@ -61,8 +61,16 @@ class BasePlatform(ABC):
         self.logger = get_logger(f"platform.{self.PLATFORM_NAME}")
         self._page: Page | None = None
 
-    async def get_page(self) -> Page:
-        """Get or create a page for this platform."""
+    async def get_page(self, force_new: bool = False) -> Page:
+        """Get or create a page for this platform.
+
+        Args:
+            force_new: If True, always create a new page (for concurrent operations)
+        """
+        if force_new:
+            # Create a new page without storing it (caller is responsible for closing)
+            return await self.session_manager.get_page(self.PLATFORM_NAME)
+
         if self._page is None or self._page.is_closed():
             self._page = await self.session_manager.get_page(self.PLATFORM_NAME)
         return self._page

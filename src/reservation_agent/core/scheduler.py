@@ -40,7 +40,7 @@ class JobScheduler:
         }
         job_defaults = {
             "coalesce": True,  # Combine multiple missed runs
-            "max_instances": 1,  # Only one instance of each job
+            "max_instances": 3,  # Allow up to 3 concurrent instances per job
             "misfire_grace_time": 60,  # Allow 60s grace for misfires
         }
 

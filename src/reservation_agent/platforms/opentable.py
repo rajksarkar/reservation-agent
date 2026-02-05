@@ -116,38 +116,83 @@ class OpenTablePlatform(BasePlatform):
         party_size: int,
     ) -> AvailabilityResult:
         """Check availability on OpenTable for a specific date."""
-        page = await self.get_page()
-
-        # Set up API response interception
-        interceptor = RequestInterceptor(page)
-        await interceptor.start(["/availability"])
-
         # Build URL - Firefox handles OpenTable; Chromium is often blocked
         url = f"{self.BASE_URL}/r/{restaurant.venue_id}?covers={party_size}&dateTime={date}%2019%3A00"
         self.logger.info("checking_availability", url=url, date=date)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(4)  # Let slots populate
+        # Use a dedicated page for this check (allows concurrent checks)
+        page = await self.get_page(force_new=True)
+        interceptor = None
 
-        # Try to get slots from API response
-        slots = []
-        api_responses = interceptor.get_captured("/availability")
+        try:
+            # Retry navigation up to 3 times
+            max_retries = 3
+            last_error = None
 
-        if api_responses:
-            for resp in api_responses:
-                slots.extend(self._parse_api_availability(resp.get("body", {})))
-        else:
-            # Fallback: parse from DOM
-            slots = await self._parse_dom_availability(page)
+            for attempt in range(max_retries):
+                try:
+                    # Set up API response interception
+                    interceptor = RequestInterceptor(page)
+                    await interceptor.start(["/availability"])
 
-        self.logger.info("found_slots", count=len(slots), date=date)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await asyncio.sleep(4)  # Let slots populate
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    last_error = e
+                    self.logger.warning(
+                        "navigation_failed_retrying",
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                        error=str(e),
+                    )
+                    if attempt < max_retries - 1:
+                        # Clear interceptor and reload
+                        if interceptor:
+                            interceptor.clear()
+                        await asyncio.sleep(2)  # Brief pause before retry
+            else:
+                # All retries failed
+                raise last_error or Exception("Navigation failed after retries")
 
-        return AvailabilityResult(
-            available_slots=slots,
-            date=date,
-            party_size=party_size,
-            checked_at=datetime.now(),
-        )
+            # Check for "no availability" message first
+            no_avail = await page.evaluate("""() => {
+                const text = document.body.innerText;
+                return text.includes("no online availability") ||
+                       text.includes("No availability") ||
+                       text.includes("no availability");
+            }""")
+
+            # Try to get slots from API response
+            slots = []
+            api_responses = interceptor.get_captured("/availability") if interceptor else []
+
+            if no_avail:
+                self.logger.info("no_availability_message_detected", date=date)
+                # Even with no-availability message, check API for actual data
+                if api_responses:
+                    for resp in api_responses:
+                        slots.extend(self._parse_api_availability(resp.get("body", {})))
+                # Do NOT fall through to DOM parsing - "also like" section has other restaurants
+            elif api_responses:
+                for resp in api_responses:
+                    slots.extend(self._parse_api_availability(resp.get("body", {})))
+            else:
+                # Fallback: parse from DOM only for target restaurant's slot area
+                slots = await self._parse_dom_availability(page, restaurant.name)
+
+            self.logger.info("found_slots", count=len(slots), date=date)
+
+            return AvailabilityResult(
+                available_slots=slots,
+                date=date,
+                party_size=party_size,
+                checked_at=datetime.now(),
+            )
+        finally:
+            # Always close the dedicated page
+            if not page.is_closed():
+                await page.close()
 
     def _parse_api_availability(self, response: dict) -> list[TimeSlot]:
         """Parse availability from OpenTable API response."""
@@ -189,41 +234,32 @@ class OpenTablePlatform(BasePlatform):
             return f"{hour:02d}:{minute}"
         return None
 
-    async def _parse_dom_availability(self, page: Page) -> list[TimeSlot]:
-        """Parse availability from page DOM."""
+    async def _parse_dom_availability(self, page: Page, restaurant_name: str = "") -> list[TimeSlot]:
+        """Parse availability from page DOM for the target restaurant only."""
         slots = []
         try:
-            # Try different possible selectors
-            selectors = [
-                self.SELECTORS["time_slots"],
-                self.SELECTORS["time_button"],
-                'button[class*="time"]',
-                '[data-test*="slot"]',
-            ]
+            # Only match slots whose aria-label references the target restaurant
+            slot_links = await page.query_selector_all('li[data-test^="time-slot-"] a[role="button"]')
+            restaurant_lower = restaurant_name.lower() if restaurant_name else ""
 
-            for selector in selectors:
-                elements = await page.query_selector_all(selector)
-                if elements:
-                    for elem in elements:
-                        time_text = await elem.text_content()
-                        data_time = await elem.get_attribute("data-time")
+            for link in slot_links:
+                if not await link.is_visible():
+                    continue
+                aria = (await link.get_attribute("aria-label") or "").lower()
+                # Only accept slots for the target restaurant (or accept all if name unknown)
+                if restaurant_lower and restaurant_lower not in aria:
+                    continue
 
-                        if data_time:
-                            time_24h = self._convert_to_24h(data_time)
-                        elif time_text:
-                            time_24h = self._convert_to_24h(time_text.strip())
-                        else:
-                            continue
-
-                        if time_24h:
-                            slots.append(
-                                TimeSlot(
-                                    time=time_24h,
-                                    slot_id=data_time or time_24h,
-                                    slot_type=None,
-                                )
-                            )
-                    break  # Found slots, stop trying selectors
+                text = (await link.text_content() or "").strip()
+                time_24h = self._convert_to_24h(text)
+                if time_24h:
+                    slots.append(
+                        TimeSlot(
+                            time=time_24h,
+                            slot_id=text,
+                            slot_type=None,
+                        )
+                    )
 
         except Exception as e:
             self.logger.warning("dom_parse_error", error=str(e))
@@ -235,9 +271,11 @@ class OpenTablePlatform(BasePlatform):
         slot: TimeSlot,
         party_size: int,
         dry_run: bool = False,
+        date: str | None = None,
     ) -> BookingResult:
         """Book a specific slot on OpenTable."""
-        page = await self.get_page()
+        # Use a dedicated page to avoid concurrent navigation conflicts
+        page = await self.get_page(force_new=True)
         helper = PageHelper(page)
 
         try:
@@ -249,38 +287,95 @@ class OpenTablePlatform(BasePlatform):
                 dry_run=dry_run,
             )
 
+            # Navigate to restaurant page if not already there
+            if date:
+                url = f"{self.BASE_URL}/r/{restaurant.venue_id}?covers={party_size}&dateTime={date}%20{slot.time.replace(':', '%3A')}"
+                self.logger.info("navigating_to_restaurant", url=url)
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(4)  # Let slots populate
+
             # Click on the time slot
-            # Try multiple strategies to find the slot
+            # Convert 24h time to 12h for matching DOM text (e.g. "19:00" -> "7:00 PM")
+            slot_hour = int(slot.time.split(":")[0])
+            slot_minute = slot.time.split(":")[1]
+            if slot_hour == 0:
+                display_time = f"12:{slot_minute} AM"
+            elif slot_hour < 12:
+                display_time = f"{slot_hour}:{slot_minute} AM"
+            elif slot_hour == 12:
+                display_time = f"12:{slot_minute} PM"
+            else:
+                display_time = f"{slot_hour - 12}:{slot_minute} PM"
+
             clicked = False
 
-            # Strategy 1: by data-time attribute
-            slot_selector = f'button[data-time="{slot.time}"]'
-            if await page.query_selector(slot_selector):
-                await helper.wait_and_click(slot_selector)
-                clicked = True
+            # Strategy 1: find visible slot by aria-label containing the time AND restaurant name
+            restaurant_lower = restaurant.name.lower()
+            slot_links = await page.query_selector_all('li[data-test^="time-slot-"] a[role="button"]')
+            for link in slot_links:
+                if not await link.is_visible():
+                    continue
+                aria_label = await link.get_attribute("aria-label") or ""
+                text = await link.text_content() or ""
+                # Must match the time AND reference the target restaurant (not other restaurants)
+                if display_time in aria_label or display_time in text:
+                    if restaurant_lower in aria_label.lower() or "reserve" not in aria_label.lower():
+                        await link.click()
+                        clicked = True
+                        break
 
-            # Strategy 2: by slot ID
-            if not clicked and slot.slot_id:
-                slot_selector = f'button[data-slot-hash="{slot.slot_id}"]'
-                if await page.query_selector(slot_selector):
-                    await helper.wait_and_click(slot_selector)
-                    clicked = True
-
-            # Strategy 3: search all time buttons
+            # Strategy 2: find visible slot by text content (scoped to target restaurant)
             if not clicked:
-                buttons = await page.query_selector_all('[data-test="time-slot"], button[data-time]')
+                slot_items = await page.query_selector_all('li[data-test^="time-slot-"]')
+                for item in slot_items:
+                    if not await item.is_visible():
+                        continue
+                    text = await item.text_content() or ""
+                    if display_time in text:
+                        # Check aria-label of child link for restaurant name
+                        child_link = await item.query_selector('a[role="button"]')
+                        if child_link:
+                            aria = (await child_link.get_attribute("aria-label") or "").lower()
+                            if restaurant_lower not in aria and "reserve" in aria:
+                                continue  # Skip - this is another restaurant's slot
+                        clickable = await item.query_selector("a, button")
+                        if clickable:
+                            await clickable.click()
+                        else:
+                            await item.click()
+                        clicked = True
+                        break
+
+            # Strategy 3: fallback to older selectors
+            if not clicked:
+                buttons = await page.query_selector_all('button[data-time], [data-test="time-slot"]')
                 for btn in buttons:
+                    if not await btn.is_visible():
+                        continue
                     btn_time = await btn.get_attribute("data-time")
-                    btn_text = await btn.text_content()
-                    if btn_time == slot.time or (btn_text and slot.time in btn_text):
+                    btn_text = await btn.text_content() or ""
+                    if btn_time == slot.time or display_time in btn_text:
                         await btn.click()
                         clicked = True
                         break
 
             if not clicked:
-                raise SlotUnavailableError(self.PLATFORM_NAME, f"Slot {slot.time} not found")
+                raise SlotUnavailableError(self.PLATFORM_NAME, f"Slot {slot.time} ({display_time}) not found")
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
+
+            # Handle seating options page if present (Standard / Outdoor / etc.)
+            if "seating-options" in page.url:
+                self.logger.info("selecting_seating_option", option="Standard")
+                # Click the first "Select" button (Standard seating)
+                select_buttons = await page.query_selector_all('button')
+                for btn in select_buttons:
+                    if await btn.is_visible():
+                        text = await btn.text_content() or ""
+                        if text.strip() == "Select":
+                            await btn.click()
+                            break
+                await asyncio.sleep(3)
 
             if dry_run:
                 self.logger.info("dry_run_stopping_before_confirm")
@@ -290,8 +385,27 @@ class OpenTablePlatform(BasePlatform):
                     error_message="Dry run - stopped before confirmation",
                 )
 
-            # Click complete reservation button
-            await helper.wait_and_click(self.SELECTORS["complete_reservation"], timeout=10000)
+            # Click complete reservation button (try multiple selectors)
+            complete_clicked = False
+            for complete_sel in [
+                self.SELECTORS["complete_reservation"],
+                'button[data-test*="complete"]',
+                'button[type="submit"]',
+            ]:
+                try:
+                    await helper.wait_and_click(complete_sel, timeout=5000)
+                    complete_clicked = True
+                    break
+                except Exception:
+                    continue
+
+            if not complete_clicked:
+                return BookingResult(
+                    success=False,
+                    error_message="Could not find complete reservation button",
+                    booked_time=slot.time,
+                )
+
             await asyncio.sleep(3)
 
             # Check for confirmation
@@ -330,3 +444,7 @@ class OpenTablePlatform(BasePlatform):
                 error_message=str(e),
                 booked_time=slot.time,
             )
+        finally:
+            # Always close the dedicated page
+            if not page.is_closed():
+                await page.close()
