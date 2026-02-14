@@ -1,9 +1,11 @@
 """APScheduler-based job scheduling."""
 
 import asyncio
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Coroutine
+from zoneinfo import ZoneInfo
 
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.jobstores.memory import MemoryJobStore
@@ -111,15 +113,20 @@ class JobScheduler:
             )
             return job_id
 
-        # Schedule the job
+        # Schedule the job with extended misfire grace time so it still fires
+        # after macOS sleep (default 60s is too short for laptop wake delays)
         self.scheduler.add_job(
             callback,
             trigger=DateTrigger(run_date=wake_datetime),
             id=job_id,
             name=f"release_snipe_{job_id}",
             replace_existing=True,
+            misfire_grace_time=7200,  # 2 hours — survive long sleep/wake delays
             kwargs=kwargs,
         )
+
+        # Schedule macOS wake 2 minutes before snipe time
+        self._schedule_system_wake(wake_datetime - timedelta(minutes=2))
 
         logger.info(
             "scheduled_release_snipe",
@@ -130,6 +137,37 @@ class JobScheduler:
         )
 
         return job_id
+
+    def _schedule_system_wake(self, wake_datetime: datetime) -> None:
+        """Schedule macOS to wake from sleep before a snipe.
+
+        Uses `pmset schedule wake` so the laptop is awake when the job fires.
+        Requires running as admin or having appropriate pmset permissions.
+        Failures are logged but non-fatal — the extended misfire_grace_time
+        serves as a fallback.
+        """
+        if wake_datetime <= datetime.now():
+            return
+
+        # wake_datetime is a naive datetime in ET (the scheduler's timezone).
+        # pmset interprets times in the system's local timezone, so convert.
+        et_tz = ZoneInfo("America/New_York")
+        wake_local = wake_datetime.replace(tzinfo=et_tz).astimezone()
+        pmset_time = wake_local.strftime("%m/%d/%Y %H:%M:%S")
+        cmd = ["sudo", "pmset", "schedule", "wake", pmset_time]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                logger.info("scheduled_system_wake", wake_time=pmset_time)
+            else:
+                logger.warning(
+                    "pmset_schedule_failed",
+                    returncode=result.returncode,
+                    stderr=result.stderr.strip(),
+                )
+        except Exception as e:
+            logger.warning("pmset_schedule_error", error=str(e))
 
     def schedule_cancellation_monitor(
         self,

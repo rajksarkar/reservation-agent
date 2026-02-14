@@ -163,7 +163,7 @@ class Orchestrator:
                     monitor_cancellations=restaurant_config.monitor_cancellations,
                 )
 
-                # Schedule release snipe
+                # Schedule release snipe (returns without scheduling if already past)
                 job_id = f"snipe_{restaurant.id}_{target_date}"
                 self.scheduler.schedule_release_snipe(
                     job_id=job_id,
@@ -174,6 +174,36 @@ class Orchestrator:
                     booking_id=booking.id,
                     restaurant_config=restaurant_config,
                 )
+
+                # Recovery: if release time already passed but booking is still
+                # PENDING, the snipe was missed (e.g. laptop was asleep). Try now.
+                if booking.status == BookingStatus.PENDING.value:
+                    target = datetime.strptime(target_date, "%Y-%m-%d")
+                    release_date = target - timedelta(
+                        days=restaurant_config.release_days_ahead
+                    )
+                    rh, rm = map(int, restaurant_config.release_time.split(":"))
+                    release_dt = release_date.replace(
+                        hour=rh, minute=rm, second=0, microsecond=0
+                    )
+                    wake_dt = release_dt - timedelta(
+                        seconds=self.config.scheduler.snipe_wake_before
+                    )
+                    if wake_dt < datetime.now():
+                        logger.info(
+                            "recovering_missed_snipe",
+                            restaurant=restaurant_config.name,
+                            target_date=target_date,
+                            scheduled_for=wake_dt.isoformat(),
+                            late_by_seconds=int(
+                                (datetime.now() - wake_dt).total_seconds()
+                            ),
+                        )
+                        asyncio.create_task(
+                            self._handle_release_snipe(
+                                booking.id, restaurant_config
+                            )
+                        )
 
                 # Schedule cancellation monitoring
                 if restaurant_config.monitor_cancellations:
