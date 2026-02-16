@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import {
   Box,
   Button,
@@ -13,9 +13,8 @@ import {
   DialogTitle,
   Grid,
   IconButton,
-  InputAdornment,
+  LinearProgress,
   Stack,
-  TextField,
   Typography,
   Alert,
 } from "@mui/material";
@@ -24,8 +23,7 @@ import {
   Close,
   Link as LinkIcon,
   LinkOff,
-  Visibility,
-  VisibilityOff,
+  OpenInNew,
 } from "@mui/icons-material";
 import { createClient } from "@/lib/supabase/client";
 
@@ -39,6 +37,7 @@ interface PlatformAccount {
 
 interface VerifiedAccount {
   username: string;
+  authMethod: string;
   verified: boolean;
 }
 
@@ -63,14 +62,15 @@ const platforms = [
   },
 ];
 
+type AuthStep = "idle" | "launching" | "interactive" | "capturing" | "done" | "error";
+
 export default function PlatformsPage() {
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [verifiedAccounts, setVerifiedAccounts] = useState<Record<string, VerifiedAccount>>({});
-  const [connectDialog, setConnectDialog] = useState<string | null>(null);
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [connectPlatform, setConnectPlatform] = useState<string | null>(null);
+  const [authStep, setAuthStep] = useState<AuthStep>("idle");
+  const [authSessionId, setAuthSessionId] = useState<string | null>(null);
+  const [liveViewUrl, setLiveViewUrl] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
   const supabase = createClient();
@@ -85,7 +85,6 @@ export default function PlatformsPage() {
       .select("id, platform, is_connected, last_verified_at, created_at");
     if (data) {
       setAccounts(data);
-      // Verify each connected account's stored credentials
       for (const account of data.filter((a) => a.is_connected)) {
         verifyAccount(account.platform);
       }
@@ -99,51 +98,98 @@ export default function PlatformsPage() {
       if (res.ok && data.verified) {
         setVerifiedAccounts((prev) => ({
           ...prev,
-          [platform]: { username: data.username, verified: true },
+          [platform]: {
+            username: data.username,
+            authMethod: data.authMethod || "credentials",
+            verified: true,
+          },
         }));
       } else {
         setVerifiedAccounts((prev) => ({
           ...prev,
-          [platform]: { username: "", verified: false },
+          [platform]: { username: "", authMethod: "", verified: false },
         }));
       }
     } catch {
       setVerifiedAccounts((prev) => ({
         ...prev,
-        [platform]: { username: "", verified: false },
+        [platform]: { username: "", authMethod: "", verified: false },
       }));
     }
   }
 
-  async function handleConnect() {
-    if (!connectDialog || !email || !password) return;
-    setLoading(true);
+  const startBrowserAuth = useCallback(async (platform: string) => {
+    setConnectPlatform(platform);
+    setAuthStep("launching");
     setError("");
-
-    const platformName = platforms.find((p) => p.id === connectDialog)?.name || connectDialog;
+    setLiveViewUrl(null);
+    setAuthSessionId(null);
 
     try {
-      const res = await fetch(`/api/platforms/${connectDialog}/connect`, {
+      const res = await fetch(`/api/platforms/${platform}/browser-auth/start`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: email, password }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to connect");
 
-      // Verify credentials were stored correctly
-      await verifyAccount(connectDialog);
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to start browser session");
+      }
+
+      setAuthSessionId(data.authSessionId);
+      setLiveViewUrl(data.liveViewUrl);
+      setAuthStep("interactive");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to launch browser");
+      setAuthStep("error");
+    }
+  }, []);
+
+  async function completeBrowserAuth() {
+    if (!authSessionId || !connectPlatform) return;
+    setAuthStep("capturing");
+
+    try {
+      const res = await fetch(`/api/platforms/${connectPlatform}/browser-auth/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authSessionId }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to capture session");
+      }
+
+      setAuthStep("done");
+      const platformName = platforms.find((p) => p.id === connectPlatform)?.name || connectPlatform;
+      setSuccessMessage(`${platformName} connected successfully via browser login!`);
 
       await loadAccounts();
-      setSuccessMessage(`${platformName} connected successfully as ${email}`);
-      setConnectDialog(null);
-      setEmail("");
-      setPassword("");
+
+      setTimeout(() => {
+        closeDialog();
+      }, 1500);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Connection failed");
-    } finally {
-      setLoading(false);
+      setError(err instanceof Error ? err.message : "Failed to save session");
+      setAuthStep("error");
     }
+  }
+
+  async function closeDialog() {
+    // Cancel the browser session if it's still active
+    if (authSessionId && authStep !== "done" && authStep !== "idle") {
+      fetch(`/api/platforms/${connectPlatform}/browser-auth/complete`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authSessionId }),
+      }).catch(() => {});
+    }
+
+    setConnectPlatform(null);
+    setAuthStep("idle");
+    setAuthSessionId(null);
+    setLiveViewUrl(null);
+    setError("");
   }
 
   async function handleDisconnect(accountId: string) {
@@ -155,13 +201,15 @@ export default function PlatformsPage() {
     return accounts.find((a) => a.platform === platformId && a.is_connected);
   }
 
+  const currentPlatform = platforms.find((p) => p.id === connectPlatform);
+
   return (
     <Box>
       <Typography variant="h4" fontWeight={700} sx={{ mb: 1 }}>
         Connected Platforms
       </Typography>
       <Typography color="text.secondary" sx={{ mb: 4 }}>
-        Connect your restaurant platform accounts to enable automated reservations.
+        Connect your restaurant platform accounts by logging in through a secure browser session.
       </Typography>
 
       {successMessage && (
@@ -212,13 +260,15 @@ export default function PlatformsPage() {
                         <Stack direction="row" alignItems="center" spacing={0.5}>
                           <Check sx={{ fontSize: 16, color: "success.main" }} />
                           <Typography variant="body2" color="text.secondary">
-                            Signed in as <strong>{verified.username}</strong>
+                            {verified.authMethod === "browser"
+                              ? "Authenticated via browser session"
+                              : <>Signed in as <strong>{verified.username}</strong></>}
                           </Typography>
                         </Stack>
                       ) : (
                         <Alert severity="error" variant="outlined" sx={{ py: 0.5 }}>
                           <Typography variant="body2">
-                            Credentials could not be verified. Please reconnect.
+                            Session expired or invalid. Please reconnect.
                           </Typography>
                         </Alert>
                       )}
@@ -228,11 +278,11 @@ export default function PlatformsPage() {
                     <Stack spacing={1}>
                       <Button
                         variant="outlined"
-                        startIcon={<LinkIcon />}
-                        onClick={() => setConnectDialog(platform.id)}
+                        startIcon={<OpenInNew />}
+                        onClick={() => startBrowserAuth(platform.id)}
                         fullWidth
                       >
-                        Update Credentials
+                        Reconnect
                       </Button>
                       <Button
                         variant="outlined"
@@ -248,7 +298,7 @@ export default function PlatformsPage() {
                     <Button
                       variant="contained"
                       startIcon={<LinkIcon />}
-                      onClick={() => setConnectDialog(platform.id)}
+                      onClick={() => startBrowserAuth(platform.id)}
                       fullWidth
                     >
                       Connect Account
@@ -261,73 +311,115 @@ export default function PlatformsPage() {
         })}
       </Grid>
 
-      {/* Connect Dialog */}
+      {/* Browser Auth Dialog */}
       <Dialog
-        open={!!connectDialog}
-        onClose={() => {
-          setConnectDialog(null);
-          setError("");
-        }}
-        maxWidth="sm"
+        open={!!connectPlatform}
+        onClose={closeDialog}
+        maxWidth="lg"
         fullWidth
+        PaperProps={{
+          sx: { height: "85vh", maxHeight: "85vh", display: "flex", flexDirection: "column" },
+        }}
       >
-        <DialogTitle>
+        <DialogTitle sx={{ pb: 1 }}>
           <Stack direction="row" justifyContent="space-between" alignItems="center">
-            Connect {platforms.find((p) => p.id === connectDialog)?.name}
-            <IconButton onClick={() => setConnectDialog(null)} size="small">
+            <Stack>
+              <Typography variant="h6" fontWeight={600}>
+                {authStep === "done"
+                  ? `${currentPlatform?.name} Connected!`
+                  : `Sign in to ${currentPlatform?.name}`}
+              </Typography>
+              {authStep === "interactive" && (
+                <Typography variant="body2" color="text.secondary">
+                  Log in below, then click &quot;I&apos;m Logged In&quot; when done
+                </Typography>
+              )}
+            </Stack>
+            <IconButton onClick={closeDialog} size="small">
               <Close />
             </IconButton>
           </Stack>
         </DialogTitle>
-        <DialogContent>
+
+        <DialogContent
+          sx={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            p: 0,
+            overflow: "hidden",
+          }}
+        >
           {error && (
-            <Alert severity="error" sx={{ mb: 2 }}>
+            <Alert severity="error" sx={{ mx: 3, mt: 2 }}>
               {error}
             </Alert>
           )}
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-            Your credentials are encrypted with AES-256-GCM before storage.
-          </Typography>
-          <TextField
-            fullWidth
-            label="Email"
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            sx={{ mb: 2 }}
-          />
-          <TextField
-            fullWidth
-            label="Password"
-            type={showPassword ? "text" : "password"}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            slotProps={{
-              input: {
-                endAdornment: (
-                  <InputAdornment position="end">
-                    <IconButton
-                      onClick={() => setShowPassword(!showPassword)}
-                      edge="end"
-                      size="small"
-                    >
-                      {showPassword ? <VisibilityOff /> : <Visibility />}
-                    </IconButton>
-                  </InputAdornment>
-                ),
-              },
-            }}
-          />
+
+          {authStep === "launching" && (
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 2 }}>
+              <LinearProgress sx={{ width: 200 }} />
+              <Typography color="text.secondary">
+                Launching secure browser...
+              </Typography>
+            </Box>
+          )}
+
+          {authStep === "interactive" && liveViewUrl && (
+            <Box sx={{ flex: 1, position: "relative" }}>
+              <iframe
+                src={`${liveViewUrl}&navbar=false`}
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  border: "none",
+                  display: "block",
+                }}
+                allow="clipboard-read; clipboard-write"
+              />
+            </Box>
+          )}
+
+          {authStep === "capturing" && (
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 2 }}>
+              <LinearProgress sx={{ width: 200 }} />
+              <Typography color="text.secondary">
+                Capturing session...
+              </Typography>
+            </Box>
+          )}
+
+          {authStep === "done" && (
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 2 }}>
+              <Check sx={{ fontSize: 64, color: "success.main" }} />
+              <Typography variant="h6" color="success.main">
+                Connected successfully!
+              </Typography>
+            </Box>
+          )}
         </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 3 }}>
-          <Button onClick={() => setConnectDialog(null)}>Cancel</Button>
-          <Button
-            variant="contained"
-            onClick={handleConnect}
-            disabled={loading || !email || !password}
-          >
-            {loading ? "Verifying & Connecting..." : "Connect"}
+
+        <DialogActions sx={{ px: 3, pb: 3, pt: 2, borderTop: "1px solid", borderColor: "divider" }}>
+          <Button onClick={closeDialog} disabled={authStep === "capturing"}>
+            Cancel
           </Button>
+          {authStep === "interactive" && (
+            <Button
+              variant="contained"
+              onClick={completeBrowserAuth}
+              size="large"
+            >
+              I&apos;m Logged In
+            </Button>
+          )}
+          {authStep === "error" && (
+            <Button
+              variant="contained"
+              onClick={() => connectPlatform && startBrowserAuth(connectPlatform)}
+            >
+              Retry
+            </Button>
+          )}
         </DialogActions>
       </Dialog>
     </Box>
