@@ -1,0 +1,14 @@
+web/
+.git/
+data/
+*.pyc
+__pycache__/
+.env
+.env.local
+.venv/
+node_modules/
+supabase/
+launchd/
+.vercel/
+config/config.yaml
+tests/

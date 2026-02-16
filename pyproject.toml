@@ -29,6 +29,8 @@ dependencies = [
     "structlog>=23.2.0",
     "click>=8.1.7",
     "rich>=13.7.0",
+    "supabase>=2.0.0",
+    "cryptography>=41.0.0",
 ]
 
 [project.optional-dependencies]
