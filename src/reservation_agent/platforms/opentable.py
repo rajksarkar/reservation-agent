@@ -64,7 +64,10 @@ class OpenTablePlatform(BasePlatform):
 
     async def login(self) -> bool:
         """Log in to OpenTable using email/password."""
-        if not self.credentials:
+        if not self.credentials or not getattr(self.credentials, 'username', None):
+            if self.session_manager.has_recent_session(self.PLATFORM_NAME, max_age_hours=168):
+                self.logger.info("skipping_login_using_session")
+                return True
             raise AuthenticationError(self.PLATFORM_NAME, "No credentials provided")
 
         try:

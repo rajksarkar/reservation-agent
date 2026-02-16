@@ -184,10 +184,6 @@ class BasePlatform(ABC):
             return True
 
         self.logger.info("session_invalid_logging_in")
-        if not self.credentials:
-            self.logger.error("no_credentials_available")
-            return False
-
         return await self.login()
 
     async def save_session(self) -> None:

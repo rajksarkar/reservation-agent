@@ -92,7 +92,11 @@ class ResyPlatform(BasePlatform):
 
     async def login(self) -> bool:
         """Log in to Resy using email/password."""
-        if not self.credentials:
+        if not self.credentials or not getattr(self.credentials, 'username', None):
+            # No credentials, but if we have a valid session, that's fine
+            if self.session_manager.has_recent_session(self.PLATFORM_NAME, max_age_hours=168):
+                self.logger.info("skipping_login_using_session")
+                return True
             raise AuthenticationError(self.PLATFORM_NAME, "No credentials provided")
 
         try:

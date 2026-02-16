@@ -50,6 +50,10 @@ class TockPlatform(BasePlatform):
 
     async def check_session_valid(self) -> bool:
         """Check if we're logged in to Tock."""
+        if self.session_manager.has_recent_session(self.PLATFORM_NAME, max_age_hours=168):
+            self.logger.info("using_recent_saved_session")
+            return True
+
         try:
             page = await self.get_page()
             await page.goto(self.BASE_URL, wait_until="domcontentloaded")
@@ -63,7 +67,10 @@ class TockPlatform(BasePlatform):
 
     async def login(self) -> bool:
         """Log in to Tock using email/password."""
-        if not self.credentials:
+        if not self.credentials or not getattr(self.credentials, 'username', None):
+            if self.session_manager.has_recent_session(self.PLATFORM_NAME, max_age_hours=168):
+                self.logger.info("skipping_login_using_session")
+                return True
             raise AuthenticationError(self.PLATFORM_NAME, "No credentials provided")
 
         try:
