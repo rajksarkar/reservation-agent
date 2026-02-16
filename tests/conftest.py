@@ -2,12 +2,22 @@
 
 import asyncio
 import os
+import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 import yaml
+
+# Mock the supabase module before any application imports that depend on it.
+# The real `supabase` Python SDK may not be installed in the test environment.
+if "supabase" not in sys.modules or not hasattr(sys.modules["supabase"], "create_client"):
+    _mock_supabase = MagicMock()
+    _mock_supabase.create_client = MagicMock()
+    _mock_supabase.Client = MagicMock
+    sys.modules["supabase"] = _mock_supabase
 
 from reservation_agent.core.config import AgentConfig, load_config
 from reservation_agent.db.models import init_database, get_session_factory
