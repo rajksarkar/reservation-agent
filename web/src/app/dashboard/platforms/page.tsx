@@ -70,7 +70,7 @@ export default function PlatformsPage() {
   const [connectPlatform, setConnectPlatform] = useState<string | null>(null);
   const [authStep, setAuthStep] = useState<AuthStep>("idle");
   const [authSessionId, setAuthSessionId] = useState<string | null>(null);
-  const [liveViewUrl, setLiveViewUrl] = useState<string | null>(null);
+  const [authPopup, setAuthPopup] = useState<Window | null>(null);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
   const supabase = createClient();
@@ -122,8 +122,13 @@ export default function PlatformsPage() {
     setConnectPlatform(platform);
     setAuthStep("launching");
     setError("");
-    setLiveViewUrl(null);
     setAuthSessionId(null);
+
+    // Close any existing popup
+    if (authPopup && !authPopup.closed) {
+      authPopup.close();
+    }
+    setAuthPopup(null);
 
     try {
       const res = await fetch(`/api/platforms/${platform}/browser-auth/start`, {
@@ -136,17 +141,34 @@ export default function PlatformsPage() {
       }
 
       setAuthSessionId(data.authSessionId);
-      setLiveViewUrl(data.liveViewUrl);
+
+      // Open BrowserBase live view in a popup window so Google OAuth and
+      // other third-party login popups work without iframe restrictions
+      const width = 1300;
+      const height = 850;
+      const left = Math.round(window.screenX + (window.outerWidth - width) / 2);
+      const top = Math.round(window.screenY + (window.outerHeight - height) / 2);
+      const popup = window.open(
+        data.liveViewUrl,
+        `browserauth_${platform}`,
+        `width=${width},height=${height},left=${left},top=${top},toolbar=no,menubar=no,scrollbars=yes,resizable=yes`
+      );
+      setAuthPopup(popup);
       setAuthStep("interactive");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to launch browser");
       setAuthStep("error");
     }
-  }, []);
+  }, [authPopup]);
 
   async function completeBrowserAuth() {
     if (!authSessionId || !connectPlatform) return;
     setAuthStep("capturing");
+
+    // Close the popup window since we're done with it
+    if (authPopup && !authPopup.closed) {
+      authPopup.close();
+    }
 
     try {
       const res = await fetch(`/api/platforms/${connectPlatform}/browser-auth/complete`, {
@@ -185,10 +207,15 @@ export default function PlatformsPage() {
       }).catch(() => {});
     }
 
+    // Close the popup window if it's still open
+    if (authPopup && !authPopup.closed) {
+      authPopup.close();
+    }
+
     setConnectPlatform(null);
     setAuthStep("idle");
     setAuthSessionId(null);
-    setLiveViewUrl(null);
+    setAuthPopup(null);
     setError("");
   }
 
@@ -315,49 +342,31 @@ export default function PlatformsPage() {
       <Dialog
         open={!!connectPlatform}
         onClose={closeDialog}
-        maxWidth="lg"
+        maxWidth="sm"
         fullWidth
-        PaperProps={{
-          sx: { height: "85vh", maxHeight: "85vh", display: "flex", flexDirection: "column" },
-        }}
       >
         <DialogTitle sx={{ pb: 1 }}>
           <Stack direction="row" justifyContent="space-between" alignItems="center">
-            <Stack>
-              <Typography variant="h6" fontWeight={600}>
-                {authStep === "done"
-                  ? `${currentPlatform?.name} Connected!`
-                  : `Sign in to ${currentPlatform?.name}`}
-              </Typography>
-              {authStep === "interactive" && (
-                <Typography variant="body2" color="text.secondary">
-                  Log in below, then click &quot;I&apos;m Logged In&quot; when done
-                </Typography>
-              )}
-            </Stack>
+            <Typography variant="h6" fontWeight={600}>
+              {authStep === "done"
+                ? `${currentPlatform?.name} Connected!`
+                : `Sign in to ${currentPlatform?.name}`}
+            </Typography>
             <IconButton onClick={closeDialog} size="small">
               <Close />
             </IconButton>
           </Stack>
         </DialogTitle>
 
-        <DialogContent
-          sx={{
-            flex: 1,
-            display: "flex",
-            flexDirection: "column",
-            p: 0,
-            overflow: "hidden",
-          }}
-        >
+        <DialogContent>
           {error && (
-            <Alert severity="error" sx={{ mx: 3, mt: 2 }}>
+            <Alert severity="error" sx={{ mb: 2 }}>
               {error}
             </Alert>
           )}
 
           {authStep === "launching" && (
-            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 2 }}>
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", py: 4, gap: 2 }}>
               <LinearProgress sx={{ width: 200 }} />
               <Typography color="text.secondary">
                 Launching secure browser...
@@ -365,23 +374,39 @@ export default function PlatformsPage() {
             </Box>
           )}
 
-          {authStep === "interactive" && liveViewUrl && (
-            <Box sx={{ flex: 1, position: "relative" }}>
-              <iframe
-                src={`${liveViewUrl}&navbar=false`}
-                style={{
-                  width: "100%",
-                  height: "100%",
-                  border: "none",
-                  display: "block",
-                }}
-                allow="clipboard-read; clipboard-write"
-              />
+          {authStep === "interactive" && (
+            <Box sx={{ py: 2 }}>
+              <Alert severity="info" sx={{ mb: 3 }}>
+                A browser window has opened for you to sign in. You can use any login method including Google, email, or password.
+              </Alert>
+              <Typography variant="body1" sx={{ mb: 2 }}>
+                <strong>Steps:</strong>
+              </Typography>
+              <Box component="ol" sx={{ pl: 2.5, mb: 2, "& li": { mb: 1 } }}>
+                <li>
+                  <Typography variant="body2">
+                    Sign in to {currentPlatform?.name} in the browser window that just opened
+                  </Typography>
+                </li>
+                <li>
+                  <Typography variant="body2">
+                    Use any login method — Google, email/password, or social login
+                  </Typography>
+                </li>
+                <li>
+                  <Typography variant="body2">
+                    Once you see your account dashboard, come back here and click <strong>&quot;I&apos;m Logged In&quot;</strong>
+                  </Typography>
+                </li>
+              </Box>
+              <Alert severity="warning" variant="outlined" sx={{ mt: 1 }}>
+                Don&apos;t see the browser window? Check if it was blocked by your popup blocker and allow popups for this site.
+              </Alert>
             </Box>
           )}
 
           {authStep === "capturing" && (
-            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 2 }}>
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", py: 4, gap: 2 }}>
               <LinearProgress sx={{ width: 200 }} />
               <Typography color="text.secondary">
                 Capturing session...
@@ -390,7 +415,7 @@ export default function PlatformsPage() {
           )}
 
           {authStep === "done" && (
-            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 2 }}>
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", py: 4, gap: 2 }}>
               <Check sx={{ fontSize: 64, color: "success.main" }} />
               <Typography variant="h6" color="success.main">
                 Connected successfully!
