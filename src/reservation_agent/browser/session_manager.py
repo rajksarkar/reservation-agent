@@ -99,8 +99,8 @@ class SessionManager:
     async def _create_fresh_context(self, platform: str) -> BrowserContext:
         """Create a fresh browser context for a platform (caller must hold _lock).
 
-        For OpenTable, if the browser itself has died the cached instance is
-        discarded and a new one is launched before retrying.
+        If the browser itself has died, the cached instance is discarded and a
+        new one is launched before retrying.
         """
         browser_type = PLATFORM_BROWSER.get(platform, "chromium")
 
@@ -108,9 +108,6 @@ class SessionManager:
             browser = await self._get_browser(browser_type)
             context = await self._create_context(platform, browser)
         except Exception:
-            if platform != "opentable":
-                raise
-            # Firefox for OpenTable may have died — discard and relaunch
             logger.warning("browser_dead_relaunching", browser=browser_type)
             self._browsers.pop(browser_type, None)
             browser = await self._get_browser(browser_type)
@@ -122,15 +119,13 @@ class SessionManager:
     async def get_page(self, platform: str) -> Page:
         """Get a new page in the platform's context.
 
-        For OpenTable (Firefox), if context.new_page() fails on a stale/dead
-        context the cached context is discarded and a fresh one is created.
+        If context.new_page() fails (stale/dead context), the cached context
+        is discarded and a fresh one is created before retrying.
         """
         context = await self.get_context(platform)
         try:
             page = await context.new_page()
         except Exception:
-            if platform != "opentable":
-                raise
             logger.warning("stale_context_detected_on_new_page", platform=platform)
             async with self._lock:
                 self._contexts.pop(platform, None)
