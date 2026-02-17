@@ -173,6 +173,17 @@ class MultiUserOrchestrator:
             # Check each target date
             for target_date in request.get("target_dates", []):
                 start_time = datetime.now()
+
+                # OpenTable: single-page check+book avoids Firefox crash
+                if isinstance(platform, OpenTablePlatform):
+                    booked = await self._opentable_poll_attempt(
+                        request_id, user_id, platform, restaurant_config,
+                        target_date, start_time,
+                    )
+                    if booked:
+                        return
+                    continue
+
                 try:
                     result = await platform.check_availability(
                         restaurant_config, target_date, request["party_size"]
@@ -502,6 +513,85 @@ class MultiUserOrchestrator:
         except Exception as e:
             logger.warning("snipe_book_error", slot_time=slot.time, error=str(e))
 
+        return False
+
+    async def _opentable_poll_attempt(
+        self,
+        request_id: str,
+        user_id: str,
+        platform: OpenTablePlatform,
+        restaurant_config: RestaurantConfig,
+        target_date: str,
+        start_time: datetime,
+    ) -> bool:
+        """Single-page OpenTable poll: check + book on one Firefox page (cancellation monitor)."""
+        try:
+            book_result, slot = await platform.check_and_book(
+                restaurant=restaurant_config,
+                date=target_date,
+                party_size=restaurant_config.party_size,
+                preferred_times=restaurant_config.preferred_times,
+                dry_run=self.config.dry_run,
+            )
+        except SlotUnavailableError:
+            return False
+        except Exception as e:
+            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+            logger.error("opentable_poll_error", error=str(e), date=target_date)
+            self.repo.log_attempt(
+                request_id=request_id,
+                attempt_type="cancellation_check",
+                result="error",
+                error_message=str(e),
+                duration_ms=duration_ms,
+            )
+            return False
+
+        if book_result is None:
+            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+            self.repo.log_attempt(
+                request_id=request_id,
+                attempt_type="cancellation_check",
+                result="no_availability",
+                duration_ms=duration_ms,
+            )
+            return False
+
+        duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
+        if book_result.success:
+            self.repo.update_request_status(
+                request_id=request_id,
+                status="booked",
+                booked_date=target_date,
+                booked_time=book_result.booked_time,
+                confirmation_number=book_result.confirmation_number,
+            )
+            self.repo.log_attempt(
+                request_id=request_id,
+                attempt_type="cancellation_check",
+                result="success",
+                slot_time=slot.time if slot else None,
+                duration_ms=duration_ms,
+            )
+            self.repo.log_activity(
+                user_id=user_id,
+                event_type="booking_success",
+                title=f"Booked {restaurant_config.name}!",
+                description=f"{target_date} at {book_result.booked_time}",
+                request_id=request_id,
+            )
+            logger.info("booking_successful", confirmation=book_result.confirmation_number)
+            return True
+
+        self.repo.log_attempt(
+            request_id=request_id,
+            attempt_type="cancellation_check",
+            result="slot_taken",
+            slot_time=slot.time if slot else None,
+            error_message=book_result.error_message,
+            duration_ms=duration_ms,
+        )
         return False
 
     async def _opentable_snipe_attempt(
