@@ -117,6 +117,51 @@ const timeSlots = [
   "21:00-22:00",
 ];
 
+/**
+ * Compute the first date whose slots haven't been released yet.
+ * E.g. if today is Feb 16 and restaurant releases 6 days ahead at 9AM ET,
+ * then slots through Feb 22 are already out (released today at 9AM),
+ * and Feb 23 onwards requires a snipe.
+ */
+function getSnipeCutoffDate(restaurant: RestaurantOption): Date | null {
+  if (!restaurant.release_days_ahead) return null;
+  const releaseTime = restaurant.release_time ?? "09:00:00";
+  const [rh, rm] = releaseTime.split(":").map(Number);
+  const daysAhead = restaurant.release_days_ahead;
+
+  // Get current ET offset
+  const etOffset = (() => {
+    const s = new Date().toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      timeZoneName: "shortOffset",
+    });
+    const m = s.match(/GMT([+-]\d+)/);
+    return m ? parseInt(m[1]) : -5;
+  })();
+
+  const now = new Date();
+  // Walk forward from today: the first date where
+  // release_datetime (target - daysAhead at rh:rm ET) is still in the future
+  for (let offset = 0; offset < 90; offset++) {
+    const target = addDays(startOfDay(now), daysAhead + offset);
+    const relDay = addDays(startOfDay(now), offset);
+    const releaseUTC = new Date(
+      Date.UTC(
+        relDay.getFullYear(),
+        relDay.getMonth(),
+        relDay.getDate(),
+        rh - etOffset,
+        rm,
+        0,
+      ),
+    );
+    if (now < releaseUTC) {
+      return target;
+    }
+  }
+  return null;
+}
+
 function formatReleaseTime(time: string | null): string {
   if (!time) return "";
   const [h, m] = time.split(":");
@@ -381,19 +426,33 @@ export default function NewReservationPage() {
                         {selectedRestaurant.neighborhood || "NYC"}
                       </Typography>
                       {(selectedRestaurant.release_time || selectedRestaurant.release_schedule_notes) && (
-                        <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mt: 1.5 }}>
-                          <Info sx={{ fontSize: 16, color: "primary.main" }} />
-                          <Typography variant="body2" color="primary.main">
-                            Reservations drop at{" "}
-                            <strong>{formatReleaseTime(selectedRestaurant.release_time)}</strong>
-                            {selectedRestaurant.release_days_ahead
-                              ? `, ${selectedRestaurant.release_days_ahead} days ahead`
-                              : ""}
-                            {selectedRestaurant.release_schedule_notes
-                              ? ` (${selectedRestaurant.release_schedule_notes})`
-                              : ""}
-                          </Typography>
-                        </Stack>
+                        <Box sx={{ mt: 1.5 }}>
+                          <Stack direction="row" alignItems="center" spacing={0.5}>
+                            <Info sx={{ fontSize: 16, color: "primary.main" }} />
+                            <Typography variant="body2" color="primary.main">
+                              Reservations drop at{" "}
+                              <strong>{formatReleaseTime(selectedRestaurant.release_time)}</strong>
+                              {selectedRestaurant.release_days_ahead
+                                ? `, ${selectedRestaurant.release_days_ahead} days ahead`
+                                : ""}
+                              {selectedRestaurant.release_schedule_notes
+                                ? ` (${selectedRestaurant.release_schedule_notes})`
+                                : ""}
+                            </Typography>
+                          </Stack>
+                          {selectedRestaurant.release_days_ahead && (() => {
+                            const snipeCutoff = getSnipeCutoffDate(selectedRestaurant);
+                            if (!snipeCutoff) return null;
+                            return (
+                              <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mt: 0.5 }}>
+                                <Warning sx={{ fontSize: 16, color: "warning.main" }} />
+                                <Typography variant="body2" color="warning.main" fontWeight={500}>
+                                  {format(snipeCutoff, "MMM d")} onwards: slots not yet released — available via snipe
+                                </Typography>
+                              </Stack>
+                            );
+                          })()}
+                        </Box>
                       )}
                     </CardContent>
                   </Card>
