@@ -7,9 +7,10 @@ browser contexts and credentials.
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from reservation_agent.browser.session_manager import SessionManager
 from reservation_agent.core.config import AgentConfig, RestaurantConfig
@@ -17,6 +18,7 @@ from reservation_agent.core.exceptions import (
     AuthenticationError,
     SlotUnavailableError,
 )
+from reservation_agent.core.scheduler import RapidPoller
 from reservation_agent.db.supabase_client import SupabaseRepository
 from reservation_agent.platforms.base import BasePlatform, TimeSlot
 from reservation_agent.platforms.opentable import OpenTablePlatform
@@ -48,6 +50,10 @@ class MultiUserOrchestrator:
         # Shared session manager
         self.session_manager: SessionManager | None = None
         self._running = False
+
+        # Snipe scheduling state
+        self._scheduled_snipes: set[str] = set()  # "requestId_targetDate" keys already scheduled
+        self._active_snipe_requests: set[str] = set()  # request IDs currently being sniped
 
     async def start(self) -> None:
         """Initialize browser session manager."""
@@ -82,6 +88,20 @@ class MultiUserOrchestrator:
 
         logger.info("processing_requests", count=len(requests))
 
+        # Schedule snipes for release_snipe requests
+        for req in requests:
+            if req.get("release_snipe"):
+                self._schedule_snipes(req)
+
+        # Filter out requests currently being sniped for normal cancellation polling
+        cancellation_requests = [
+            r for r in requests
+            if r["id"] not in self._active_snipe_requests
+        ]
+
+        if not cancellation_requests:
+            return
+
         # Process requests concurrently (limited concurrency)
         sem = asyncio.Semaphore(3)
 
@@ -90,7 +110,7 @@ class MultiUserOrchestrator:
                 await self._process_request(req)
 
         await asyncio.gather(
-            *[process_with_sem(r) for r in requests],
+            *[process_with_sem(r) for r in cancellation_requests],
             return_exceptions=True,
         )
 
@@ -269,6 +289,219 @@ class MultiUserOrchestrator:
                     error_message=str(e),
                     duration_ms=duration_ms,
                 )
+                continue
+
+        return False
+
+    def _schedule_snipes(self, request: dict) -> None:
+        """Schedule snipe tasks for upcoming release windows."""
+        request_id = request["id"]
+        restaurant = request.get("restaurants", {})
+        restaurant_name = restaurant.get("name", "unknown")
+
+        release_time = (
+            request.get("release_time")
+            or restaurant.get("release_time")
+            or "09:00"
+        )
+        release_days_ahead = (
+            request.get("release_days_ahead")
+            or restaurant.get("release_days_ahead")
+            or 14
+        )
+
+        et = ZoneInfo("America/New_York")
+        now = datetime.now(tz=et)
+        wake_before = self.config.scheduler.snipe_wake_before
+        snipe_duration = self.config.scheduler.snipe_duration
+
+        release_hour, release_minute = map(int, release_time.split(":"))
+
+        for target_date in request.get("target_dates", []):
+            snipe_id = f"{request_id}_{target_date}"
+            if snipe_id in self._scheduled_snipes:
+                continue
+
+            target = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=et)
+            release_date = target - timedelta(days=release_days_ahead)
+            release_dt = release_date.replace(
+                hour=release_hour, minute=release_minute, second=0, microsecond=0
+            )
+            wake_dt = release_dt - timedelta(seconds=wake_before)
+            end_dt = release_dt + timedelta(seconds=snipe_duration)
+
+            if now > end_dt:
+                # Window already passed
+                continue
+
+            # Only schedule if wake time is within the next 2 hours
+            if wake_dt > now + timedelta(hours=2):
+                continue
+
+            self._scheduled_snipes.add(snipe_id)
+
+            logger.info(
+                "snipe_scheduled",
+                request_id=request_id,
+                restaurant=restaurant_name,
+                target_date=target_date,
+                release_dt=release_dt.isoformat(),
+                wake_dt=wake_dt.isoformat(),
+            )
+
+            asyncio.create_task(
+                self._execute_snipe(snipe_id, request, target_date, wake_dt)
+            )
+
+    async def _execute_snipe(
+        self, snipe_id: str, request: dict, target_date: str, wake_dt: datetime
+    ) -> None:
+        """Execute a snipe: sleep until wake time, then rapid-poll for slots."""
+        request_id = request["id"]
+        user_id = request["user_id"]
+        restaurant = request.get("restaurants", {})
+        platform_name = restaurant.get("platform", "")
+
+        try:
+            self._active_snipe_requests.add(request_id)
+
+            # Sleep until wake time
+            et = ZoneInfo("America/New_York")
+            now = datetime.now(tz=et)
+            if wake_dt > now:
+                sleep_seconds = (wake_dt - now).total_seconds()
+                logger.info(
+                    "snipe_sleeping",
+                    request_id=request_id,
+                    sleep_seconds=int(sleep_seconds),
+                )
+                await asyncio.sleep(sleep_seconds)
+
+            with LogContext(
+                request_id=request_id,
+                user_id=user_id[:8],
+                restaurant=restaurant.get("name", "unknown"),
+            ):
+                logger.info("snipe_starting", target_date=target_date)
+
+                platform = await self._get_platform(user_id, platform_name)
+                if not platform:
+                    logger.warning("snipe_no_platform_credentials")
+                    return
+
+                try:
+                    if not await platform.ensure_logged_in():
+                        logger.error("snipe_login_failed")
+                        return
+                except AuthenticationError as e:
+                    logger.error("snipe_auth_error", error=str(e))
+                    return
+
+                restaurant_config = RestaurantConfig(
+                    name=restaurant.get("name", ""),
+                    platform=platform_name,
+                    venue_id=restaurant.get("venue_id", ""),
+                    party_size=request.get("party_size", 2),
+                    target_dates=request.get("target_dates", []),
+                    preferred_times=request.get("preferred_times", []),
+                    release_time=request.get("release_time", "09:00"),
+                    release_days_ahead=request.get("release_days_ahead", 14),
+                    monitor_cancellations=request.get("monitor_cancellations", True),
+                )
+
+                poller = RapidPoller(
+                    interval_ms=self.config.scheduler.snipe_rapid_poll_interval * 1000,
+                    duration_seconds=self.config.scheduler.snipe_duration,
+                )
+
+                success = await poller.poll(
+                    self._snipe_attempt,
+                    request_id=request_id,
+                    user_id=user_id,
+                    platform=platform,
+                    restaurant_config=restaurant_config,
+                    target_date=target_date,
+                )
+
+                if not success:
+                    logger.warning("snipe_timeout", target_date=target_date)
+                    self.repo.log_attempt(
+                        request_id=request_id,
+                        attempt_type="snipe",
+                        result="no_availability",
+                    )
+        except Exception as e:
+            logger.error("snipe_error", error=str(e), request_id=request_id)
+        finally:
+            self._active_snipe_requests.discard(request_id)
+            self._scheduled_snipes.discard(snipe_id)
+
+    async def _snipe_attempt(
+        self,
+        request_id: str,
+        user_id: str,
+        platform: BasePlatform,
+        restaurant_config: RestaurantConfig,
+        target_date: str,
+    ) -> bool:
+        """Single snipe attempt: check availability and try to book. Returns True on success."""
+        start_time = datetime.now()
+        try:
+            result = await platform.check_availability(
+                restaurant_config, target_date, restaurant_config.party_size
+            )
+        except Exception as e:
+            logger.warning("snipe_check_error", error=str(e))
+            return False
+
+        if not result.available_slots:
+            return False
+
+        matching_slots = platform.filter_preferred_slots(
+            result.available_slots, restaurant_config.preferred_times
+        )
+        if not matching_slots:
+            return False
+
+        for slot in matching_slots:
+            try:
+                book_result = await platform.book_slot(
+                    restaurant_config, slot, restaurant_config.party_size,
+                    dry_run=self.config.dry_run,
+                )
+                duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
+                if book_result.success:
+                    self.repo.update_request_status(
+                        request_id=request_id,
+                        status="booked",
+                        booked_date=target_date,
+                        booked_time=book_result.booked_time,
+                        confirmation_number=book_result.confirmation_number,
+                    )
+                    self.repo.log_attempt(
+                        request_id=request_id,
+                        attempt_type="snipe",
+                        result="success",
+                        slot_time=slot.time,
+                        duration_ms=duration_ms,
+                    )
+                    self.repo.log_activity(
+                        user_id=user_id,
+                        event_type="booking_success",
+                        title=f"Sniped {restaurant_config.name}!",
+                        description=f"{target_date} at {book_result.booked_time}",
+                        request_id=request_id,
+                    )
+                    logger.info(
+                        "snipe_booking_successful",
+                        confirmation=book_result.confirmation_number,
+                    )
+                    return True
+            except SlotUnavailableError:
+                continue
+            except Exception as e:
+                logger.warning("snipe_book_error", slot_time=slot.time, error=str(e))
                 continue
 
         return False
