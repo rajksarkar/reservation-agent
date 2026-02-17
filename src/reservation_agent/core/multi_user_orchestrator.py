@@ -318,7 +318,8 @@ class MultiUserOrchestrator:
         wake_before = self.config.scheduler.snipe_wake_before
         snipe_duration = self.config.scheduler.snipe_duration
 
-        release_hour, release_minute = map(int, release_time.split(":"))
+        time_parts = release_time.split(":")
+        release_hour, release_minute = int(time_parts[0]), int(time_parts[1])
 
         for target_date in request.get("target_dates", []):
             snipe_id = f"{request_id}_{target_date}"
