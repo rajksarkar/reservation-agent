@@ -389,6 +389,10 @@ class MultiUserOrchestrator:
             ):
                 logger.info("snipe_starting", target_date=target_date)
 
+                # Clear cached platform to get a fresh browser context
+                cache_key = (user_id, platform_name)
+                self._platforms.pop(cache_key, None)
+
                 platform = await self._get_platform(user_id, platform_name)
                 if not platform:
                     logger.warning("snipe_no_platform_credentials")
