@@ -27,7 +27,6 @@ import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { AdapterDateFns } from "@mui/x-date-pickers/AdapterDateFns";
 import { PickersDay, PickersDayProps } from "@mui/x-date-pickers/PickersDay";
 import { format, isSameDay, isBefore, startOfDay, addDays, subDays } from "date-fns";
-import { toZonedTime } from "date-fns-tz";
 import { createClient } from "@/lib/supabase/client";
 
 interface RestaurantOption {
@@ -54,6 +53,8 @@ interface DateReleaseInfo {
  * For each target date, compute when its slots open based on the
  * restaurant's release schedule. Returns null when the restaurant
  * has no release schedule info.
+ *
+ * Release times are in ET. We convert everything to UTC for comparison.
  */
 function analyzeDates(
   dates: string[],
@@ -65,21 +66,25 @@ function analyzeDates(
   const [rh, rm] = releaseTime.split(":").map(Number);
   const daysAhead = restaurant.release_days_ahead;
 
-  const nowET = toZonedTime(new Date(), "America/New_York");
+  // Get ET→UTC offset using Intl (handles DST automatically)
+  const etOffset = (() => {
+    const s = new Date().toLocaleString("en-US", { timeZone: "America/New_York", timeZoneName: "shortOffset" });
+    const m = s.match(/GMT([+-]\d+)/);
+    return m ? parseInt(m[1]) : -5;
+  })();
+
+  const now = new Date();
 
   return dates.map((dateStr) => {
-    const target = new Date(dateStr + "T00:00:00");
-    const relDate = subDays(target, daysAhead);
-    // Build the release datetime in ET
-    const releaseDT = new Date(
-      relDate.getFullYear(),
-      relDate.getMonth(),
-      relDate.getDate(),
-      rh,
-      rm,
-      0,
-    );
-    const released = nowET >= releaseDT;
+    const [y, mo, d] = dateStr.split("-").map(Number);
+    // Release date = target_date - daysAhead, at rh:rm ET
+    // Convert ET time to UTC: subtract the ET offset (e.g. 9 AM ET in EST = 14:00 UTC)
+    const releaseUTC = new Date(Date.UTC(y, mo - 1, d - daysAhead, rh - etOffset, rm, 0));
+
+    const released = now >= releaseUTC;
+
+    // Display date (just the calendar date, not shifted)
+    const relDisplayDate = new Date(y, mo - 1, d - daysAhead);
 
     const hour = rh === 0 ? 12 : rh > 12 ? rh - 12 : rh;
     const ampm = rh >= 12 ? "PM" : "AM";
@@ -90,9 +95,9 @@ function analyzeDates(
 
     return {
       date: dateStr,
-      releaseDate: releaseDT,
+      releaseDate: relDisplayDate,
       released,
-      releaseDateDisplay: format(releaseDT, "EEE, MMM d"),
+      releaseDateDisplay: format(relDisplayDate, "EEE, MMM d"),
       releaseTimeDisplay: timeDisplay,
     };
   });
@@ -736,7 +741,29 @@ export default function NewReservationPage() {
         {activeStep < steps.length - 1 ? (
           <Button
             variant="contained"
-            onClick={() => setActiveStep((s) => s + 1)}
+            onClick={() => {
+              // When advancing from Date step to Options step, auto-configure
+              if (activeStep === 1) {
+                const analysis = analyzeDates(selectedDates, selectedRestaurant);
+                if (analysis && analysis.length > 0) {
+                  const hasReleased = analysis.some((a) => a.released);
+                  const hasUnreleased = analysis.some((a) => !a.released);
+                  if (hasUnreleased) {
+                    setReleaseSnipe(true);
+                    if (selectedRestaurant?.release_time) {
+                      setReleaseTime(selectedRestaurant.release_time.substring(0, 5));
+                    }
+                    if (selectedRestaurant?.release_days_ahead) {
+                      setReleaseDaysAhead(selectedRestaurant.release_days_ahead);
+                    }
+                  }
+                  if (!hasReleased) {
+                    setMonitorCancellations(false);
+                  }
+                }
+              }
+              setActiveStep((s) => s + 1);
+            }}
             disabled={!canAdvance()}
           >
             Next
