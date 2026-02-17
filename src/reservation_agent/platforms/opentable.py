@@ -294,8 +294,8 @@ class OpenTablePlatform(BasePlatform):
             if date:
                 url = f"{self.BASE_URL}/r/{restaurant.venue_id}?covers={party_size}&dateTime={date}%20{slot.time.replace(':', '%3A')}"
                 self.logger.info("navigating_to_restaurant", url=url)
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(4)  # Let slots populate
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)  # Let slots populate
 
             # Click on the time slot
             # Convert 24h time to 12h for matching DOM text (e.g. "19:00" -> "7:00 PM")
@@ -365,12 +365,18 @@ class OpenTablePlatform(BasePlatform):
             if not clicked:
                 raise SlotUnavailableError(self.PLATFORM_NAME, f"Slot {slot.time} ({display_time}) not found")
 
-            await asyncio.sleep(3)
+            # Wait for navigation after clicking the slot
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+            self.logger.info("post_slot_click", url=page.url)
 
             # Handle seating options page if present (Standard / Outdoor / etc.)
             if "seating-options" in page.url:
                 self.logger.info("selecting_seating_option", option="Standard")
-                # Click the first "Select" button (Standard seating)
                 select_buttons = await page.query_selector_all('button')
                 for btn in select_buttons:
                     if await btn.is_visible():
@@ -378,7 +384,32 @@ class OpenTablePlatform(BasePlatform):
                         if text.strip() == "Select":
                             await btn.click()
                             break
-                await asyncio.sleep(3)
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+            # Handle specials/upgrades page if present
+            if "specials" in page.url:
+                self.logger.info("skipping_specials_page")
+                # Look for "No thanks" or "Skip" button, or just the complete button
+                for skip_text in ["No thanks", "No, thanks", "Skip"]:
+                    skip_btns = await page.query_selector_all('button')
+                    for btn in skip_btns:
+                        if await btn.is_visible():
+                            text = (await btn.text_content() or "").strip()
+                            if skip_text.lower() in text.lower():
+                                await btn.click()
+                                try:
+                                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(1)
+                                break
+                    else:
+                        continue
+                    break
 
             if dry_run:
                 self.logger.info("dry_run_stopping_before_confirm")
@@ -388,6 +419,8 @@ class OpenTablePlatform(BasePlatform):
                     error_message="Dry run - stopped before confirmation",
                 )
 
+            self.logger.info("looking_for_complete_button", url=page.url)
+
             # Click complete reservation button (try multiple selectors)
             complete_clicked = False
             for complete_sel in [
@@ -396,31 +429,53 @@ class OpenTablePlatform(BasePlatform):
                 'button[type="submit"]',
             ]:
                 try:
-                    await helper.wait_and_click(complete_sel, timeout=5000)
+                    await helper.wait_and_click(complete_sel, timeout=10000)
                     complete_clicked = True
+                    self.logger.info("clicked_complete_reservation")
                     break
                 except Exception:
                     continue
 
             if not complete_clicked:
+                # Log page content for debugging
+                page_text = await page.evaluate("() => document.body.innerText.substring(0, 500)")
+                self.logger.warning(
+                    "complete_button_not_found",
+                    url=page.url,
+                    page_text=page_text,
+                )
                 return BookingResult(
                     success=False,
                     error_message="Could not find complete reservation button",
                     booked_time=slot.time,
                 )
 
-            await asyncio.sleep(3)
+            # Wait for confirmation page
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
 
             # Check for confirmation
+            confirmation_number = None
             confirmation_elem = await page.query_selector(
                 self.SELECTORS["confirmation_number"]
             )
-            confirmation_number = None
             if confirmation_elem:
                 confirmation_number = await confirmation_elem.text_content()
 
-            # Verify success by URL or confirmation element
-            if "confirmation" in page.url.lower() or confirmation_number:
+            # Verify success by URL, confirmation element, or page text
+            page_text = await page.evaluate("() => document.body.innerText")
+            is_confirmed = (
+                "confirmation" in page.url.lower()
+                or confirmation_number
+                or "reservation is confirmed" in page_text.lower()
+                or "you're all booked" in page_text.lower()
+                or "booking confirmed" in page_text.lower()
+            )
+
+            if is_confirmed:
                 self.logger.info(
                     "booking_successful",
                     confirmation=confirmation_number,
@@ -432,6 +487,11 @@ class OpenTablePlatform(BasePlatform):
                     booked_time=slot.time,
                 )
             else:
+                self.logger.warning(
+                    "booking_not_confirmed",
+                    url=page.url,
+                    page_text=page_text[:300],
+                )
                 return BookingResult(
                     success=False,
                     error_message="Could not confirm booking success",

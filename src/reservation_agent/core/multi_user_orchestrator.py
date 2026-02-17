@@ -240,7 +240,8 @@ class MultiUserOrchestrator:
                 logger.info("attempting_book", slot_time=slot.time, date=target_date)
 
                 book_result = await platform.book_slot(
-                    restaurant_config, slot, party_size, dry_run=self.config.dry_run
+                    restaurant_config, slot, party_size,
+                    dry_run=self.config.dry_run, date=target_date,
                 )
 
                 duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
@@ -467,46 +468,47 @@ class MultiUserOrchestrator:
         if not matching_slots:
             return False
 
-        for slot in matching_slots:
-            try:
-                book_result = await platform.book_slot(
-                    restaurant_config, slot, restaurant_config.party_size,
-                    dry_run=self.config.dry_run,
-                )
-                duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+        # Only try the best matching slot per attempt (let rapid poller retry)
+        slot = matching_slots[0]
+        try:
+            book_result = await platform.book_slot(
+                restaurant_config, slot, restaurant_config.party_size,
+                dry_run=self.config.dry_run,
+                date=target_date,
+            )
+            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
-                if book_result.success:
-                    self.repo.update_request_status(
-                        request_id=request_id,
-                        status="booked",
-                        booked_date=target_date,
-                        booked_time=book_result.booked_time,
-                        confirmation_number=book_result.confirmation_number,
-                    )
-                    self.repo.log_attempt(
-                        request_id=request_id,
-                        attempt_type="snipe",
-                        result="success",
-                        slot_time=slot.time,
-                        duration_ms=duration_ms,
-                    )
-                    self.repo.log_activity(
-                        user_id=user_id,
-                        event_type="booking_success",
-                        title=f"Sniped {restaurant_config.name}!",
-                        description=f"{target_date} at {book_result.booked_time}",
-                        request_id=request_id,
-                    )
-                    logger.info(
-                        "snipe_booking_successful",
-                        confirmation=book_result.confirmation_number,
-                    )
-                    return True
-            except SlotUnavailableError:
-                continue
-            except Exception as e:
-                logger.warning("snipe_book_error", slot_time=slot.time, error=str(e))
-                continue
+            if book_result.success:
+                self.repo.update_request_status(
+                    request_id=request_id,
+                    status="booked",
+                    booked_date=target_date,
+                    booked_time=book_result.booked_time,
+                    confirmation_number=book_result.confirmation_number,
+                )
+                self.repo.log_attempt(
+                    request_id=request_id,
+                    attempt_type="snipe",
+                    result="success",
+                    slot_time=slot.time,
+                    duration_ms=duration_ms,
+                )
+                self.repo.log_activity(
+                    user_id=user_id,
+                    event_type="booking_success",
+                    title=f"Sniped {restaurant_config.name}!",
+                    description=f"{target_date} at {book_result.booked_time}",
+                    request_id=request_id,
+                )
+                logger.info(
+                    "snipe_booking_successful",
+                    confirmation=book_result.confirmation_number,
+                )
+                return True
+        except SlotUnavailableError:
+            pass
+        except Exception as e:
+            logger.warning("snipe_book_error", slot_time=slot.time, error=str(e))
 
         return False
 
