@@ -1,5 +1,6 @@
 # Credentials and secrets - NEVER commit
 config/config.yaml
+.env*
 
 # Runtime data
 data/

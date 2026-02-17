@@ -17,20 +17,20 @@ If any files changed in `supabase/migrations/`:
 supabase db push
 ```
 Requires `SUPABASE_ACCESS_TOKEN` env var or `supabase login` first.
-Project ref: `wibcyyhqpyutxikfnqsn`
+Project ref: `<your-supabase-project-ref>`
 
 ### 3. Railway — Redeploy Worker & Web
 
-Both services live in the **same Railway project** (`b596e976-3dab-4c69-b40e-dbea6b633597`).
+Both services live in the **same Railway project** (`<your-railway-project-id>`).
 Deploy them separately:
 
 ```bash
 # Deploy the worker (from repo root — uses root Dockerfile)
-railway link --project b596e976-3dab-4c69-b40e-dbea6b633597 --environment production --service reservation-worker
+railway link --project <your-railway-project-id> --environment production --service reservation-worker
 railway up
 
 # Deploy the web frontend — MUST use --path-as-root to scope build context to web/
-railway link --project b596e976-3dab-4c69-b40e-dbea6b633597 --environment production --service web
+railway link --project <your-railway-project-id> --environment production --service web
 railway up web/ --path-as-root
 ```
 
@@ -38,8 +38,8 @@ railway up web/ --path-as-root
 Without `--path-as-root`, Railway uploads the entire repo and picks up the root Python Dockerfile instead of `web/Dockerfile`.
 
 - Worker service name: `reservation-worker`
-- Web service name: `web` (domain: `web-production-4f2b8.up.railway.app`)
-- After deploying web, re-link to worker: `railway link --project b596e976-3dab-4c69-b40e-dbea6b633597 --environment production --service reservation-worker`
+- Web service name: `web`
+- After deploying web, re-link to worker: `railway link --project <your-railway-project-id> --environment production --service reservation-worker`
 
 ### Prerequisites
 These CLI tools and auth tokens must be available:

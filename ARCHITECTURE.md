@@ -30,7 +30,7 @@
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Next.js 16 (App Router)                       │
-│         Railway: web-production-4f2b8.up.railway.app            │
+│         Railway: <your-railway-domain>.up.railway.app            │
 │                                                                  │
 │  Pages: Landing, Auth (login/signup/forgot/reset), Dashboard,   │
 │         New Reservation Wizard, Platform Management              │
@@ -42,7 +42,7 @@
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Supabase (Hosted)                            │
-│              wibcyyhqpyutxikfnqsn.supabase.co                  │
+│              <your-supabase-ref>.supabase.co                    │
 │                                                                  │
 │  Auth: Email/password, Google OAuth, password reset              │
 │  Database: Postgres with RLS policies                           │
@@ -629,17 +629,17 @@ Circuit breaker: 5 consecutive failures → 60s cooldown per platform
 
 | Service | Type | URL/Status |
 |---------|------|------------|
-| **web** | Next.js (Dockerfile) | `https://web-production-4f2b8.up.railway.app` |
+| **web** | Next.js (Dockerfile) | `https://<your-railway-domain>.up.railway.app` |
 | **worker** | Python/Playwright (Dockerfile) | Running, polling Supabase |
 
-**Railway Project**: `reservation-worker` (ID: `b596e976-3dab-4c69-b40e-dbea6b633597`)
+**Railway Project**: `reservation-worker` (ID: `<your-railway-project-id>`)
 
 ### Environment Variables
 
 #### Web Service (Next.js)
 | Variable | Description |
 |----------|-------------|
-| `NEXT_PUBLIC_SUPABASE_URL` | `https://wibcyyhqpyutxikfnqsn.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_URL` | `https://<your-supabase-ref>.supabase.co` |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon/public key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (server-side only) |
 | `ENCRYPTION_KEY` | Master key for credential encryption (legacy auth) |
@@ -677,11 +677,11 @@ Circuit breaker: 5 consecutive failures → 60s cooldown per platform
 
 ### Supabase
 
-- **Project ref**: `wibcyyhqpyutxikfnqsn`
+- **Project ref**: `<your-supabase-ref>`
 - **Region**: `aws-0-us-east-1`
 - **Auth**: Email/password + Google OAuth
-- **Site URL**: `https://web-production-4f2b8.up.railway.app`
-- **Redirect URLs**: `https://web-production-4f2b8.up.railway.app/**`
+- **Site URL**: `https://<your-railway-domain>.up.railway.app`
+- **Redirect URLs**: `https://<your-railway-domain>.up.railway.app/**`
 - **Migrations**: Managed via `supabase db push` from `supabase/migrations/`
 
 ---
