@@ -20,12 +20,26 @@ Requires `SUPABASE_ACCESS_TOKEN` env var or `supabase login` first.
 Project ref: `wibcyyhqpyutxikfnqsn`
 
 ### 3. Railway — Redeploy Worker & Web
+
+Both services live in the **same Railway project** (`b596e976-3dab-4c69-b40e-dbea6b633597`).
+Deploy them separately:
+
 ```bash
+# Deploy the worker (from repo root)
+cd /Users/rsarkar/reservation-agent
+railway link --project b596e976-3dab-4c69-b40e-dbea6b633597 --environment production --service reservation-worker
+railway up
+
+# Deploy the web frontend (from web/ directory)
+cd /Users/rsarkar/reservation-agent/web
+railway link --project b596e976-3dab-4c69-b40e-dbea6b633597 --environment production --service web
 railway up
 ```
-Or if Railway is connected to the git branch, the push in step 1 triggers auto-deploy.
 
-Railway project ID: `b596e976-3dab-4c69-b40e-dbea6b633597`
+**Important:** The CLI must be linked to the correct service before running `railway up`.
+- Worker service name: `reservation-worker`
+- Web service name: `web`
+- After deploying web, re-link to worker: `railway link --project b596e976-3dab-4c69-b40e-dbea6b633597 --environment production --service reservation-worker`
 
 ### Prerequisites
 These CLI tools and auth tokens must be available:
