@@ -195,13 +195,13 @@ reservation-agent/
 
 ### New Reservation Wizard (4 Steps)
 
-1. **Restaurant Selection**: Autocomplete search across 50+ NYC restaurants. Shows platform badge, cuisine, neighborhood, price range. Displays release schedule info (e.g., "Releases 30 days ahead at 10:00 AM").
+1. **Restaurant Selection**: Autocomplete search across 50+ NYC restaurants. Shows platform badge, cuisine, neighborhood, price range. Displays release schedule info (e.g., "Releases 30 days ahead at 10:00 AM"). Shows **snipe cutoff date** — the first date whose slots haven't been released yet (e.g., "Feb 23 onwards: slots not yet released — available via snipe").
 
-2. **Date & Time**: MUI `DateCalendar` with click-to-select/deselect dates (highlighted in primary color). Time range chips: Morning, Lunch, Afternoon, Dinner, Late Night. **Platform connection check** — warns with alert + "Connect Now" button if the required platform (Resy/OpenTable/Tock) isn't connected yet.
+2. **Date & Time**: MUI `DateCalendar` with click-to-select/deselect dates (highlighted in primary color). Time range chips: Morning, Lunch, Afternoon, Dinner, Late Night. **Platform connection check** — warns with alert + "Connect Now" button if the required platform (Resy/OpenTable/Tock) isn't connected yet. **Slot Release Schedule card** — shows which selected dates are already released (monitored for cancellations) vs. unreleased (sniped when they open). Uses `Intl.DateTimeFormat` with `America/New_York` timezone for accurate ET offset calculation (do NOT use `date-fns-tz` — it had timezone comparison bugs).
 
-3. **Options**: Toggle cancellation monitoring (on by default). Release snipe settings — auto-populated from restaurant's known release schedule. Party size selector.
+3. **Options**: Toggle cancellation monitoring and release snipe. **Auto-configured** based on date analysis — if all selected dates are unreleased, cancellation monitoring is disabled (no existing slots to monitor) and release snipe is enabled. If all dates are already released, the opposite. Mixed dates get both enabled. Party size selector.
 
-4. **Review**: Summary of all selections before submission.
+4. **Review**: Summary of all selections with per-date monitoring strategy breakdown (which dates get cancellation monitoring vs. snipe).
 
 ### API Routes
 
@@ -209,7 +209,7 @@ reservation-agent/
 |----------|--------|-------------|
 | `/api/restaurants` | GET | List all restaurants from catalog |
 | `/api/reservations` | GET | User's reservation requests (with restaurant join) |
-| `/api/reservations` | POST | Create new reservation request |
+| `/api/reservations` | POST | Create new reservation request (auto-derives `release_snipe` and `monitor_cancellations` from release schedule) |
 | `/api/reservations/[id]` | GET | Single request detail |
 | `/api/reservations/[id]` | DELETE | Delete a request |
 | `/api/platforms/[platform]/connect` | POST | Legacy: verify credentials with platform API, encrypt, store |
@@ -518,12 +518,15 @@ class TimeSlot:
 - **Availability**: Scrapes slot elements: `li[data-test^="time-slot-"] a[role="button"]`
 - **Critical guard**: Checks for "no online availability" message before parsing DOM (page shows "Restaurants you may also like" with other restaurants' slots using identical selectors)
 - **aria-label filter**: Validates slot's aria-label contains target restaurant name
-- **Booking flow**:
-  1. Click matching slot link
-  2. Handle optional "seating-options" intermediate page
-  3. Handle optional "specials" page
-  4. Click "Complete Reservation"
+- **Single-page `check_and_book` flow**: Availability checking and booking are consolidated into one Playwright page session to prevent Firefox crashes from redundant page navigations and stale browser contexts. The method:
+  1. Opens the restaurant page and checks for available slots
+  2. If a matching slot is found, clicks it on the same page
+  3. Handles optional "seating-options" intermediate page (prefers non-outdoor seating)
+  4. Handles optional "specials" page
+  5. Clicks "Complete Reservation" and verifies confirmation
+- **Helper methods**: `_to_display_time`, `_click_time_slot`, `_handle_seating_options`, `_handle_specials`, `_click_confirm_and_verify` — shared between snipe and cancellation-monitoring paths
 - **Page management**: `force_new=True` pages, closed in `finally` block
+- **Used by both paths**: `_opentable_snipe_attempt` (for release snipes) and `_opentable_poll_attempt` (for cancellation monitoring) in the orchestrator both call `check_and_book`
 
 ### Tock (Chromium)
 
@@ -610,9 +613,10 @@ Every 120s (configurable):
     ↓
 For each active request with monitor_cancellations=true:
     ↓
-check_availability(date, party_size)
+Skip dates where _is_date_unreleased() is true (no slots exist yet)
     ↓
-If matching slot found → book_slot()
+For OpenTable: platform.check_and_book() (single-page flow)
+For Resy/Tock: check_availability() → book_slot() if match found
     ↓
 Circuit breaker: 5 consecutive failures → 60s cooldown per platform
 ```
@@ -715,6 +719,21 @@ Circuit breaker: 5 consecutive failures → 60s cooldown per platform
 
 ### Credential Verification Before Storage (Legacy)
 - Platform credentials are verified against the actual platform API before being encrypted and stored. This prevents users from entering wrong passwords and wondering why bookings fail.
+
+### OpenTable Single-Page Booking (`check_and_book`)
+- Opening separate pages for checking availability and then booking caused Firefox to crash from stale browser contexts and redundant page navigations. The fix consolidates both operations into a single Playwright page session — the same page that loads availability also clicks the slot and completes the booking. This eliminated crashes and improved reliability for both snipe and cancellation-monitoring flows.
+
+### Stale Browser Context Detection
+- The `SessionManager` detects dead Playwright browser contexts by catching errors on `context.new_page()`. When a stale context is detected, it explicitly closes the old context and browser, then creates fresh ones. This prevents memory leaks and cascading failures.
+
+### Release Schedule Auto-Configuration
+- The frontend and API both analyze target dates against the restaurant's release schedule (`release_days_ahead`, `release_time`) to auto-derive `release_snipe` and `monitor_cancellations` flags. Dates whose slots haven't been released yet get release snipe; dates with already-released slots get cancellation monitoring. The worker's `_is_date_unreleased()` helper also skips cancellation polling for unreleased dates (there are no existing slots to monitor for cancellations).
+
+### ET Timezone Calculations (Frontend)
+- Use `Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York' })` to determine the current ET offset, then perform all comparisons in UTC. Do NOT use `date-fns-tz` — its `toZonedTime()` function caused incorrect date comparisons that made the auto-configuration logic fail silently.
+
+### Railway Web Service Deployment
+- The web service and worker service share the same Railway project. Without `--path-as-root`, `railway up` uploads the entire repo root and picks up the root Python `Dockerfile` instead of `web/Dockerfile`, causing the web service to run the Python worker and crash with `KeyError: 'SUPABASE_URL'`. Always deploy with `railway up web/ --path-as-root`.
 
 ### Dark Theme Design
 - The frontend uses a centralized dark theme (`web/src/lib/theme.ts`) with indigo primary (#6366f1), amber secondary (#f59e0b), deep black backgrounds (#0a0a0a/#141414), 12px border radius, Inter font, and no-transform buttons. This creates a cohesive modern aesthetic across all pages.
