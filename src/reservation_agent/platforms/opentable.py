@@ -511,3 +511,362 @@ class OpenTablePlatform(BasePlatform):
             # Always close the dedicated page
             if not page.is_closed():
                 await page.close()
+
+    # ------------------------------------------------------------------
+    # Combined single-page check + book (used by snipe flow)
+    # ------------------------------------------------------------------
+    async def check_and_book(
+        self,
+        restaurant: RestaurantConfig,
+        date: str,
+        party_size: int,
+        preferred_times: list[str],
+        dry_run: bool = False,
+    ) -> tuple[BookingResult | None, TimeSlot | None]:
+        """Check availability and book in a single page session.
+
+        Instead of navigating twice (once to check, once to book), this keeps
+        the same page open: find slots → click the best one → handle seating
+        options → confirm.  Returns (BookingResult, slot) or (None, None) when
+        no matching slot is found.
+        """
+        url = (
+            f"{self.BASE_URL}/r/{restaurant.venue_id}"
+            f"?covers={party_size}&dateTime={date}%2019%3A00"
+        )
+        self.logger.info("check_and_book_start", url=url, date=date)
+
+        page = await self.get_page(force_new=True)
+        helper = PageHelper(page)
+        interceptor = None
+
+        try:
+            # ---- 1. Navigate to restaurant page ----
+            max_retries = 3
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    interceptor = RequestInterceptor(page)
+                    await interceptor.start(["/availability"])
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await asyncio.sleep(4)
+                    break
+                except Exception as e:
+                    last_error = e
+                    self.logger.warning(
+                        "check_and_book_nav_retry",
+                        attempt=attempt + 1,
+                        error=str(e),
+                    )
+                    if interceptor:
+                        interceptor.clear()
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+            else:
+                raise last_error or Exception("Navigation failed after retries")
+
+            # ---- 2. Collect available slots ----
+            slots: list[TimeSlot] = []
+            api_responses = (
+                interceptor.get_captured("/availability") if interceptor else []
+            )
+
+            no_avail = await page.evaluate("""() => {
+                const text = document.body.innerText;
+                return text.includes("no online availability") ||
+                       text.includes("No availability") ||
+                       text.includes("no availability");
+            }""")
+
+            if no_avail:
+                self.logger.info("check_and_book_no_avail", date=date)
+                if api_responses:
+                    for resp in api_responses:
+                        slots.extend(self._parse_api_availability(resp.get("body", {})))
+            elif api_responses:
+                for resp in api_responses:
+                    slots.extend(self._parse_api_availability(resp.get("body", {})))
+            else:
+                slots = await self._parse_dom_availability(page, restaurant.name)
+
+            self.logger.info("check_and_book_slots", count=len(slots))
+
+            if not slots:
+                return None, None
+
+            # ---- 3. Filter for preferred times ----
+            matching = self.filter_preferred_slots(slots, preferred_times)
+            if not matching:
+                self.logger.info("check_and_book_no_match", preferred=preferred_times)
+                return None, None
+
+            slot = matching[0]
+            self.logger.info("check_and_book_clicking_slot", time=slot.time)
+
+            # ---- 4. Click the slot on the same page ----
+            display_time = self._to_display_time(slot.time)
+            clicked = await self._click_time_slot(page, display_time, restaurant.name)
+
+            if not clicked:
+                raise SlotUnavailableError(
+                    self.PLATFORM_NAME,
+                    f"Slot {slot.time} ({display_time}) not found on page",
+                )
+
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+            self.logger.info("check_and_book_post_click", url=page.url)
+
+            # ---- 5. Handle seating options (prefer non-outdoor) ----
+            await self._handle_seating_options(page)
+
+            # ---- 6. Handle specials/upgrades page ----
+            await self._handle_specials(page)
+
+            # ---- 7. Confirm reservation ----
+            if dry_run:
+                self.logger.info("dry_run_stopping_before_confirm")
+                return (
+                    BookingResult(
+                        success=False,
+                        booked_time=slot.time,
+                        error_message="Dry run - stopped before confirmation",
+                    ),
+                    slot,
+                )
+
+            result = await self._click_confirm_and_verify(page, helper, slot.time)
+            return result, slot
+
+        except SlotUnavailableError:
+            raise
+        except Exception as e:
+            self.logger.error("check_and_book_error", error=str(e))
+            return (
+                BookingResult(success=False, error_message=str(e), booked_time=None),
+                None,
+            )
+        finally:
+            if not page.is_closed():
+                await page.close()
+
+    # ------------------------------------------------------------------
+    # Shared helpers (used by both book_slot and check_and_book)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_display_time(time_24h: str) -> str:
+        """Convert 24-hour time (e.g. '19:00') to display format ('7:00 PM')."""
+        hour = int(time_24h.split(":")[0])
+        minute = time_24h.split(":")[1]
+        if hour == 0:
+            return f"12:{minute} AM"
+        if hour < 12:
+            return f"{hour}:{minute} AM"
+        if hour == 12:
+            return f"12:{minute} PM"
+        return f"{hour - 12}:{minute} PM"
+
+    async def _click_time_slot(
+        self, page: Page, display_time: str, restaurant_name: str
+    ) -> bool:
+        """Click a time-slot button on the page. Returns True on success."""
+        restaurant_lower = restaurant_name.lower()
+
+        # Strategy 1: aria-label on slot links
+        slot_links = await page.query_selector_all(
+            'li[data-test^="time-slot-"] a[role="button"]'
+        )
+        for link in slot_links:
+            if not await link.is_visible():
+                continue
+            aria = await link.get_attribute("aria-label") or ""
+            text = await link.text_content() or ""
+            if display_time in aria or display_time in text:
+                if restaurant_lower in aria.lower() or "reserve" not in aria.lower():
+                    await link.click()
+                    return True
+
+        # Strategy 2: slot items by text content
+        slot_items = await page.query_selector_all('li[data-test^="time-slot-"]')
+        for item in slot_items:
+            if not await item.is_visible():
+                continue
+            text = await item.text_content() or ""
+            if display_time in text:
+                child_link = await item.query_selector('a[role="button"]')
+                if child_link:
+                    aria = (await child_link.get_attribute("aria-label") or "").lower()
+                    if restaurant_lower not in aria and "reserve" in aria:
+                        continue
+                clickable = await item.query_selector("a, button")
+                if clickable:
+                    await clickable.click()
+                else:
+                    await item.click()
+                return True
+
+        # Strategy 3: older selectors
+        buttons = await page.query_selector_all(
+            'button[data-time], [data-test="time-slot"]'
+        )
+        for btn in buttons:
+            if not await btn.is_visible():
+                continue
+            btn_time = await btn.get_attribute("data-time")
+            btn_text = await btn.text_content() or ""
+            if btn_time == display_time.replace(" ", "") or display_time in btn_text:
+                await btn.click()
+                return True
+
+        return False
+
+    async def _handle_seating_options(self, page: Page) -> None:
+        """Handle the seating-options page: prefer non-outdoor options."""
+        if "seating-options" not in page.url:
+            return
+
+        self.logger.info("handling_seating_options")
+
+        # Collect all option cards with their labels and Select buttons.
+        # Each option is typically a section/div with a heading and a Select btn.
+        outdoor_keywords = {"outdoor", "patio", "terrace", "garden", "rooftop"}
+        preferred_btn = None
+        fallback_btn = None
+
+        select_buttons = await page.query_selector_all("button")
+        for btn in select_buttons:
+            if not await btn.is_visible():
+                continue
+            text = (await btn.text_content() or "").strip()
+            if text.lower() != "select":
+                continue
+
+            # Walk up to the parent card/container and get its full text
+            parent_text = await page.evaluate(
+                """(el) => {
+                    let node = el.parentElement;
+                    for (let i = 0; i < 5 && node; i++) { node = node.parentElement; }
+                    return node ? node.innerText : '';
+                }""",
+                btn,
+            )
+            parent_lower = parent_text.lower()
+            is_outdoor = any(kw in parent_lower for kw in outdoor_keywords)
+
+            if not is_outdoor and preferred_btn is None:
+                preferred_btn = btn
+            if fallback_btn is None:
+                fallback_btn = btn
+
+        chosen = preferred_btn or fallback_btn
+        if chosen:
+            label = "non-outdoor" if preferred_btn else "fallback"
+            self.logger.info("selecting_seating_option", choice=label)
+            await chosen.click()
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    async def _handle_specials(self, page: Page) -> None:
+        """Skip the specials/upgrades page if present."""
+        if "specials" not in page.url:
+            return
+
+        self.logger.info("skipping_specials_page")
+        for skip_text in ["No thanks", "No, thanks", "Skip"]:
+            skip_btns = await page.query_selector_all("button")
+            for btn in skip_btns:
+                if not await btn.is_visible():
+                    continue
+                text = (await btn.text_content() or "").strip()
+                if skip_text.lower() in text.lower():
+                    await btn.click()
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded", timeout=10000
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    return
+
+    async def _click_confirm_and_verify(
+        self, page: Page, helper: PageHelper, slot_time: str
+    ) -> BookingResult:
+        """Click 'Complete Reservation' and verify confirmation."""
+        self.logger.info("looking_for_complete_button", url=page.url)
+
+        complete_clicked = False
+        for sel in [
+            self.SELECTORS["complete_reservation"],
+            'button[data-test*="complete"]',
+            'button[type="submit"]',
+        ]:
+            try:
+                await helper.wait_and_click(sel, timeout=10000)
+                complete_clicked = True
+                self.logger.info("clicked_complete_reservation")
+                break
+            except Exception:
+                continue
+
+        if not complete_clicked:
+            page_text = await page.evaluate(
+                "() => document.body.innerText.substring(0, 500)"
+            )
+            self.logger.warning(
+                "complete_button_not_found", url=page.url, page_text=page_text
+            )
+            return BookingResult(
+                success=False,
+                error_message="Could not find complete reservation button",
+                booked_time=slot_time,
+            )
+
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+        # Check confirmation
+        confirmation_number = None
+        conf_elem = await page.query_selector(self.SELECTORS["confirmation_number"])
+        if conf_elem:
+            confirmation_number = await conf_elem.text_content()
+
+        page_text = await page.evaluate("() => document.body.innerText")
+        is_confirmed = (
+            "confirmation" in page.url.lower()
+            or confirmation_number
+            or "reservation is confirmed" in page_text.lower()
+            or "you're all booked" in page_text.lower()
+            or "booking confirmed" in page_text.lower()
+        )
+
+        if is_confirmed:
+            self.logger.info(
+                "booking_successful",
+                confirmation=confirmation_number,
+                time=slot_time,
+            )
+            return BookingResult(
+                success=True,
+                confirmation_number=confirmation_number,
+                booked_time=slot_time,
+            )
+
+        self.logger.warning(
+            "booking_not_confirmed", url=page.url, page_text=page_text[:300]
+        )
+        return BookingResult(
+            success=False,
+            error_message="Could not confirm booking success",
+            booked_time=slot_time,
+        )

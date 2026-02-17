@@ -455,6 +455,15 @@ class MultiUserOrchestrator:
     ) -> bool:
         """Single snipe attempt: check availability and try to book. Returns True on success."""
         start_time = datetime.now()
+
+        # OpenTable: use single-page check_and_book to avoid Firefox crash on
+        # second page navigation.
+        if isinstance(platform, OpenTablePlatform):
+            return await self._opentable_snipe_attempt(
+                request_id, user_id, platform, restaurant_config, target_date, start_time,
+            )
+
+        # All other platforms: two-step check then book
         try:
             result = await platform.check_availability(
                 restaurant_config, target_date, restaurant_config.party_size
@@ -483,30 +492,9 @@ class MultiUserOrchestrator:
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
             if book_result.success:
-                self.repo.update_request_status(
-                    request_id=request_id,
-                    status="booked",
-                    booked_date=target_date,
-                    booked_time=book_result.booked_time,
-                    confirmation_number=book_result.confirmation_number,
-                )
-                self.repo.log_attempt(
-                    request_id=request_id,
-                    attempt_type="snipe",
-                    result="success",
-                    slot_time=slot.time,
-                    duration_ms=duration_ms,
-                )
-                self.repo.log_activity(
-                    user_id=user_id,
-                    event_type="booking_success",
-                    title=f"Sniped {restaurant_config.name}!",
-                    description=f"{target_date} at {book_result.booked_time}",
-                    request_id=request_id,
-                )
-                logger.info(
-                    "snipe_booking_successful",
-                    confirmation=book_result.confirmation_number,
+                self._record_snipe_success(
+                    request_id, user_id, restaurant_config.name,
+                    target_date, book_result, slot, duration_ms,
                 )
                 return True
         except SlotUnavailableError:
@@ -515,6 +503,81 @@ class MultiUserOrchestrator:
             logger.warning("snipe_book_error", slot_time=slot.time, error=str(e))
 
         return False
+
+    async def _opentable_snipe_attempt(
+        self,
+        request_id: str,
+        user_id: str,
+        platform: OpenTablePlatform,
+        restaurant_config: RestaurantConfig,
+        target_date: str,
+        start_time: datetime,
+    ) -> bool:
+        """Single-page OpenTable snipe: check + book on one Firefox page."""
+        try:
+            book_result, slot = await platform.check_and_book(
+                restaurant=restaurant_config,
+                date=target_date,
+                party_size=restaurant_config.party_size,
+                preferred_times=restaurant_config.preferred_times,
+                dry_run=self.config.dry_run,
+            )
+        except SlotUnavailableError:
+            return False
+        except Exception as e:
+            logger.warning("opentable_snipe_error", error=str(e))
+            return False
+
+        if book_result is None:
+            return False
+
+        duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
+        if book_result.success:
+            self._record_snipe_success(
+                request_id, user_id, restaurant_config.name,
+                target_date, book_result, slot, duration_ms,
+            )
+            return True
+
+        return False
+
+    def _record_snipe_success(
+        self,
+        request_id: str,
+        user_id: str,
+        restaurant_name: str,
+        target_date: str,
+        book_result: Any,
+        slot: Any,
+        duration_ms: int,
+    ) -> None:
+        """Persist a successful snipe booking to the database."""
+        self.repo.update_request_status(
+            request_id=request_id,
+            status="booked",
+            booked_date=target_date,
+            booked_time=book_result.booked_time,
+            confirmation_number=book_result.confirmation_number,
+        )
+        self.repo.log_attempt(
+            request_id=request_id,
+            attempt_type="snipe",
+            result="success",
+            slot_time=slot.time if slot else None,
+            duration_ms=duration_ms,
+        )
+        self.repo.log_activity(
+            user_id=user_id,
+            event_type="booking_success",
+            title=f"Sniped {restaurant_name}!",
+            description=f"{target_date} at {book_result.booked_time}",
+            request_id=request_id,
+        )
+        logger.info(
+            "snipe_booking_successful",
+            confirmation=book_result.confirmation_number,
+        )
 
     async def _get_platform(self, user_id: str, platform_name: str) -> BasePlatform | None:
         """Get or create a platform instance for a user."""
