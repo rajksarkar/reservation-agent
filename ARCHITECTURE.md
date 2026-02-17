@@ -11,7 +11,7 @@
 3. [Frontend (Next.js)](#frontend-nextjs)
 4. [Backend Worker (Python)](#backend-worker-python)
 5. [Database Schema (Supabase)](#database-schema-supabase)
-6. [Credential Encryption](#credential-encryption)
+6. [Platform Authentication](#platform-authentication)
 7. [Platform Integrations](#platform-integrations)
 8. [Key Workflows](#key-workflows)
 9. [Infrastructure & Deployment](#infrastructure--deployment)
@@ -57,7 +57,7 @@
 │               reservation-worker service                        │
 │                                                                  │
 │  Polls Supabase every 30s for active requests                   │
-│  Decrypts user credentials (AES-256-GCM)                        │
+│  Loads browser sessions or decrypts credentials (AES-256-GCM)  │
 │  Launches Playwright browsers (Chromium/Firefox)                │
 │  Checks availability & books reservations                       │
 │  Logs attempts and activities back to Supabase                  │
@@ -109,7 +109,8 @@ reservation-agent/
 │   ├── config.toml                  # Supabase local dev config
 │   └── migrations/                  # SQL migrations
 │       ├── 20260215000001_initial_schema.sql
-│       └── 20260215000002_restaurant_release_schedules.sql
+│       ├── 20260215000002_restaurant_release_schedules.sql
+│       └── 20260216000002_nullable_credentials.sql
 ├── tests/                           # Test suite
 │   ├── unit/
 │   ├── integration/
@@ -139,10 +140,15 @@ reservation-agent/
 │   │   │       ├── reservations/[id]/route.ts  # GET/DELETE single
 │   │   │       ├── restaurants/route.ts        # GET restaurant catalog
 │   │   │       └── platforms/[platform]/
-│   │   │           ├── connect/route.ts    # POST: verify + encrypt + store
-│   │   │           └── verify/route.ts     # GET: decrypt + verify round-trip
+│   │   │           ├── connect/route.ts          # POST: verify + encrypt + store (legacy)
+│   │   │           ├── verify/route.ts           # GET: dual-mode verify (browser session or credentials)
+│   │   │           └── browser-auth/
+│   │   │               ├── start/route.ts        # POST: launch BrowserBase session
+│   │   │               └── complete/route.ts     # POST: capture session, DELETE: cancel
 │   │   ├── lib/                     # Shared libraries
+│   │   │   ├── browserbase.ts       # BrowserBase session manager (CDP + Playwright)
 │   │   │   ├── crypto.ts            # AES-256-GCM encrypt/decrypt
+│   │   │   ├── theme.ts             # MUI dark theme (indigo primary, Inter font)
 │   │   │   └── supabase/
 │   │   │       ├── client.ts        # Browser Supabase client
 │   │   │       └── server.ts        # Server Supabase client (cookies)
@@ -168,6 +174,7 @@ reservation-agent/
 - **MUI v7** (Material-UI) for all components
 - **MUI X Date Pickers v8** for calendar date selection
 - **Supabase SSR** (`@supabase/ssr`) for auth + database
+- **BrowserBase SDK** (`@browserbasehq/sdk`) + **Playwright Core** for cloud browser auth
 - **date-fns** for date formatting
 
 ### Pages
@@ -182,7 +189,7 @@ reservation-agent/
 | `/dashboard` | Stats cards, recent requests table, activity feed |
 | `/dashboard/reservations/new` | 4-step wizard: Restaurant → Dates/Times → Options → Review |
 | `/dashboard/reservations/[id]` | Detail view with Pause/Resume/Cancel/Delete actions |
-| `/dashboard/platforms` | Connect/verify/update Resy, OpenTable, Tock credentials |
+| `/dashboard/platforms` | Connect platforms via BrowserBase cloud browser auth |
 | `/dashboard/activity` | Full activity log |
 | `/dashboard/settings` | Notification preferences |
 
@@ -205,8 +212,11 @@ reservation-agent/
 | `/api/reservations` | POST | Create new reservation request |
 | `/api/reservations/[id]` | GET | Single request detail |
 | `/api/reservations/[id]` | DELETE | Delete a request |
-| `/api/platforms/[platform]/connect` | POST | Verify credentials with platform API, encrypt, store |
-| `/api/platforms/[platform]/verify` | GET | Decrypt stored credentials, return username |
+| `/api/platforms/[platform]/connect` | POST | Legacy: verify credentials with platform API, encrypt, store |
+| `/api/platforms/[platform]/verify` | GET | Dual-mode: return browser session status or decrypted username |
+| `/api/platforms/[platform]/browser-auth/start` | POST | Launch BrowserBase cloud browser, return live view URL |
+| `/api/platforms/[platform]/browser-auth/complete` | POST | Capture browser session (cookies/localStorage), store in Supabase |
+| `/api/platforms/[platform]/browser-auth/complete` | DELETE | Cancel and clean up BrowserBase session |
 
 ### Realtime Updates
 The dashboard subscribes to Supabase Realtime (Postgres changes on `reservation_requests` table). When the worker updates a request status (e.g., `active` → `booked`), the dashboard updates live without refresh.
@@ -232,7 +242,7 @@ The `MultiUserOrchestrator` is the core of the Railway deployment:
 
 1. **Polls** Supabase every 30s for `status='active'` reservation requests
 2. **Caches** platform instances per `(user_id, platform)` tuple
-3. **Decrypts** user credentials from Supabase using matching AES-256-GCM implementation
+3. **Auth**: Loads browser session data (cookies/localStorage) or decrypts credentials (AES-256-GCM) — supports both auth methods
 4. **Processes** up to 3 requests concurrently (asyncio semaphore)
 5. **Checks** availability using Playwright browser automation
 6. **Books** slots when matches are found
@@ -307,14 +317,16 @@ auth.users (Supabase managed)
 | id | uuid (PK) | |
 | user_id | uuid (FK) | References `auth.users(id)` |
 | platform | text | `resy`, `opentable`, or `tock` |
-| encrypted_username | text | AES-256-GCM ciphertext |
-| encrypted_password | text | AES-256-GCM ciphertext |
-| encryption_iv | text | Pipe-separated: `username_iv\|password_iv` |
-| encryption_tag | text | Pipe-separated: `username_tag\|password_tag` |
+| session_data | jsonb | BrowserBase-captured cookies/localStorage (primary auth method) |
+| encrypted_username | text (nullable) | AES-256-GCM ciphertext (legacy credential auth) |
+| encrypted_password | text (nullable) | AES-256-GCM ciphertext (legacy credential auth) |
+| encryption_iv | text (nullable) | Pipe-separated: `username_iv\|password_iv` |
+| encryption_tag | text (nullable) | Pipe-separated: `username_tag\|password_tag` |
 | is_connected | boolean | |
 | last_verified_at | timestamptz | |
 
 **RLS**: Users can CRUD own accounts. Unique on `(user_id, platform)`.
+**Dual auth**: Accounts can have either `session_data` (browser auth) or encrypted credentials (legacy). Credential columns are nullable since migration `20260216000002`.
 
 #### `restaurants`
 | Column | Type | Notes |
@@ -381,11 +393,62 @@ auth.users (Supabase managed)
 
 ---
 
-## Credential Encryption
+## Platform Authentication
 
-User platform credentials are encrypted at rest using **AES-256-GCM** with per-user key derivation.
+Two auth methods are supported. BrowserBase browser auth is the primary method; credential-based auth is legacy but still functional.
 
-### Key Derivation
+### BrowserBase Browser Auth (Primary)
+
+Users authenticate directly with Resy/OpenTable/Tock through a BrowserBase cloud browser. This supports any login method (email/password, Google OAuth, Apple ID, social login) without credentials ever passing through our UI.
+
+#### Flow
+
+```
+1. User clicks "Connect Account" on platforms page
+    ↓
+2. POST /api/platforms/[platform]/browser-auth/start
+    → Creates BrowserBase cloud browser session (viewport 1280x800)
+    → Connects via Chrome DevTools Protocol (CDP)
+    → Navigates to platform login page
+    → Returns { authSessionId, liveViewUrl }
+    ↓
+3. Frontend opens liveViewUrl in popup window (1300x850)
+    → User sees native platform login UI
+    → Logs in with any method (Google, email, etc.)
+    ↓
+4. User clicks "I'm Logged In" back in the app
+    ↓
+5. POST /api/platforms/[platform]/browser-auth/complete
+    → Extracts full storage state (cookies + localStorage) via CDP
+    → Upserts to platform_accounts with session_data
+    → Closes BrowserBase browser
+    → Logs platform_connected activity
+```
+
+#### Session Manager (`web/src/lib/browserbase.ts`)
+
+- In-memory session tracking with UUID-based session IDs
+- 10-minute TTL per session with auto-cleanup every 60s
+- Stores active Playwright browser + page connections
+- `cancelBrowserAuth()` for cleanup when user closes dialog without completing
+
+#### Login URLs by Platform
+
+| Platform | Login URL |
+|----------|-----------|
+| Resy | `https://resy.com/login` |
+| OpenTable | `https://www.opentable.com/sign-in` |
+| Tock | `https://www.exploretock.com/login` |
+
+#### Why Popup Instead of Iframe
+
+BrowserBase's live view URL has X-Frame-Options restrictions that block embedding in iframes. Additionally, Google OAuth and other third-party login flows open their own popups, which are blocked when nested inside an iframe. The solution uses `window.open()` to launch a dedicated popup window.
+
+### Credential-Based Auth (Legacy)
+
+Still supported for backward compatibility. User platform credentials are encrypted at rest using **AES-256-GCM** with per-user key derivation.
+
+#### Key Derivation
 ```
 master_key = process.env.ENCRYPTION_KEY  (shared secret)
 
@@ -395,7 +458,7 @@ Step 2: derived_key = PBKDF2(master_key, salt, iterations=100000, keylen=32, dig
 
 Each user gets a unique encryption key derived from the master key + their user ID.
 
-### Encrypt (Next.js API route → Supabase)
+#### Encrypt (Next.js API route → Supabase)
 ```
 iv = random 16 bytes
 cipher = AES-256-GCM(derived_key, iv)
@@ -407,19 +470,15 @@ Stored: { encrypted (hex), iv (hex), tag (hex) }
 
 Username and password are encrypted separately. The `encryption_iv` and `encryption_tag` columns store pipe-separated values: `username_iv|password_iv` and `username_tag|password_tag`.
 
-### Decrypt (Python worker → platform login)
+#### Decrypt (Python worker → platform login)
 The Python `supabase_client.py` implements the identical key derivation and AES-256-GCM decryption, ensuring the worker can read credentials stored by the frontend.
 
-### Credential Verification
-Before storing, the `/api/platforms/[platform]/connect` route verifies credentials are valid by calling each platform's auth API:
+### Verify Route (Dual-Mode)
 
-| Platform | Verification Endpoint |
-|----------|-----------------------|
-| Resy | `POST api.resy.com/3/auth/password` with `ResyAPI api_key` header |
-| OpenTable | `POST www.opentable.com/dapi/fe/auth/login` |
-| Tock | `POST www.exploretock.com/api/consumer/login` |
+The `/api/platforms/[platform]/verify` route detects the auth method and responds accordingly:
 
-Credentials are only stored after successful verification.
+- **Browser session auth** (has `session_data`, no `encrypted_username`): Returns `{ authMethod: "browser", username: "Browser session", verified: true }`
+- **Credential auth** (has `encrypted_username`): Decrypts and returns `{ authMethod: "credentials", username: "user@example.com", verified: true }`
 
 ---
 
@@ -484,9 +543,12 @@ POST /api/reservations → inserts to reservation_requests (status='active')
     ↓
 Python worker polls Supabase (every 30s) → finds new request
     ↓
-Worker fetches user's platform_accounts → decrypts credentials
+Worker fetches user's platform_accounts
     ↓
-Worker launches Playwright browser → logs into platform
+If session_data: load cookies/localStorage into browser
+If encrypted credentials: decrypt → log into platform
+    ↓
+Worker launches Playwright browser
     ↓
 Worker calls check_availability(date, party_size)
     ↓
@@ -498,7 +560,33 @@ If no slots:
 Dashboard updates in realtime via Supabase subscription
 ```
 
-### 2. Release Snipe (Local Mode)
+### 2. Platform Connection (BrowserBase Auth)
+
+```
+User clicks "Connect Account" for Resy/OpenTable/Tock
+    ↓
+POST /api/platforms/[platform]/browser-auth/start
+    → BrowserBase creates cloud Chromium browser
+    → Playwright connects via CDP
+    → Navigates to platform login page
+    → Returns authSessionId + liveViewUrl
+    ↓
+Frontend opens liveViewUrl in popup window (1300x850)
+    ↓
+User logs in natively (Google OAuth, email/password, etc.)
+    ↓
+User clicks "I'm Logged In" in the app dialog
+    ↓
+POST /api/platforms/[platform]/browser-auth/complete
+    → Captures cookies + localStorage from browser
+    → Upserts platform_accounts with session_data (jsonb)
+    → Closes BrowserBase session
+    → Logs platform_connected to activity_log
+    ↓
+Dashboard shows "Authenticated via browser session"
+```
+
+### 3. Release Snipe (Local Mode)
 
 ```
 Scheduler calculates: release_datetime - 30 seconds
@@ -515,7 +603,7 @@ If missed (laptop was sleeping): misfire_grace_time=7200s catches it
 On startup: if release time passed but status=PENDING → fire immediately
 ```
 
-### 3. Cancellation Monitoring
+### 4. Cancellation Monitoring
 
 ```
 Every 120s (configurable):
@@ -550,7 +638,9 @@ Circuit breaker: 5 consecutive failures → 60s cooldown per platform
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://wibcyyhqpyutxikfnqsn.supabase.co` |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon/public key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (server-side only) |
-| `ENCRYPTION_KEY` | Master key for credential encryption |
+| `ENCRYPTION_KEY` | Master key for credential encryption (legacy auth) |
+| `BROWSERBASE_API_KEY` | BrowserBase API key for cloud browser sessions |
+| `BROWSERBASE_PROJECT_ID` | BrowserBase project identifier |
 
 #### Worker Service (Python)
 | Variable | Description |
@@ -614,5 +704,17 @@ Circuit breaker: 5 consecutive failures → 60s cooldown per platform
 ### Session Reuse
 - Playwright sessions (cookies/localStorage) are persisted to disk and reused for up to 168 hours, avoiding repeated logins and reducing detection risk.
 
-### Credential Verification Before Storage
+### BrowserBase Over Credential Forms
+- Users authenticate directly with platform login pages through a BrowserBase cloud browser rather than entering credentials into our UI. This supports OAuth/social login, avoids credential handling liability, and provides a trusted native login experience. Session data (cookies/localStorage) is captured server-side via CDP after the user completes login.
+
+### Popup Window for BrowserBase Live View
+- BrowserBase's live view URL cannot be embedded in an iframe (X-Frame-Options restrictions). Google OAuth and other third-party login flows also open popups that are blocked when nested inside iframes. The solution uses `window.open()` to launch BrowserBase in a dedicated popup window (1300x850, centered).
+
+### In-Memory Session TTL
+- BrowserBase sessions are tracked in-memory with a 10-minute TTL and auto-cleanup every 60s. This prevents stale sessions from consuming BrowserBase resources if users abandon the auth flow.
+
+### Credential Verification Before Storage (Legacy)
 - Platform credentials are verified against the actual platform API before being encrypted and stored. This prevents users from entering wrong passwords and wondering why bookings fail.
+
+### Dark Theme Design
+- The frontend uses a centralized dark theme (`web/src/lib/theme.ts`) with indigo primary (#6366f1), amber secondary (#f59e0b), deep black backgrounds (#0a0a0a/#141414), 12px border radius, Inter font, and no-transform buttons. This creates a cohesive modern aesthetic across all pages.
