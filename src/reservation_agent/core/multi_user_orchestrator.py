@@ -93,10 +93,13 @@ class MultiUserOrchestrator:
             if req.get("release_snipe"):
                 self._schedule_snipes(req)
 
-        # Filter out requests currently being sniped for normal cancellation polling
+        # Filter to requests that should be cancellation-polled:
+        # - Skip requests currently being sniped
+        # - Skip snipe-only requests (release_snipe=True but monitor_cancellations=False)
         cancellation_requests = [
             r for r in requests
             if r["id"] not in self._active_snipe_requests
+            and (r.get("monitor_cancellations", True) or not r.get("release_snipe"))
         ]
 
         if not cancellation_requests:
