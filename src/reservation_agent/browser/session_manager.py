@@ -99,8 +99,8 @@ class SessionManager:
     async def _create_fresh_context(self, platform: str) -> BrowserContext:
         """Create a fresh browser context for a platform (caller must hold _lock).
 
-        If the browser itself has died, the cached instance is discarded and a
-        new one is launched before retrying.
+        If the browser itself has died, the old process is closed before
+        launching a replacement to avoid leaking memory.
         """
         browser_type = PLATFORM_BROWSER.get(platform, "chromium")
 
@@ -109,7 +109,12 @@ class SessionManager:
             context = await self._create_context(platform, browser)
         except Exception:
             logger.warning("browser_dead_relaunching", browser=browser_type)
-            self._browsers.pop(browser_type, None)
+            old_browser = self._browsers.pop(browser_type, None)
+            if old_browser:
+                try:
+                    await old_browser.close()
+                except Exception:
+                    pass
             browser = await self._get_browser(browser_type)
             context = await self._create_context(platform, browser)
 
@@ -128,7 +133,12 @@ class SessionManager:
         except Exception:
             logger.warning("stale_context_detected_on_new_page", platform=platform)
             async with self._lock:
-                self._contexts.pop(platform, None)
+                old_ctx = self._contexts.pop(platform, None)
+                if old_ctx:
+                    try:
+                        await old_ctx.close()
+                    except Exception:
+                        pass
                 context = await self._create_fresh_context(platform)
             page = await context.new_page()
         page.set_default_timeout(self.config.timeout)
