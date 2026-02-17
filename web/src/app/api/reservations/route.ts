@@ -53,6 +53,51 @@ export async function POST(request: Request) {
     );
   }
 
+  // Look up restaurant release schedule to auto-fill snipe settings
+  let resolvedSnipe = release_snipe ?? false;
+  let resolvedReleaseTime = release_time || null;
+  let resolvedReleaseDaysAhead = release_days_ahead || null;
+  let resolvedMonitorCancellations = monitor_cancellations ?? true;
+
+  if (!release_snipe) {
+    const { data: restaurant } = await supabase
+      .from("restaurants")
+      .select("release_time, release_days_ahead")
+      .eq("id", restaurant_id)
+      .single();
+
+    if (restaurant?.release_days_ahead) {
+      resolvedReleaseDaysAhead = restaurant.release_days_ahead;
+      resolvedReleaseTime = restaurant.release_time?.substring(0, 5) || "09:00";
+
+      // Check if any target date is still unreleased
+      const now = new Date();
+      const hasUnreleased = target_dates.some((d: string) => {
+        const target = new Date(d + "T00:00:00");
+        const rParts = (resolvedReleaseTime as string).split(":").map(Number);
+        const releaseDate = new Date(target);
+        releaseDate.setDate(releaseDate.getDate() - restaurant.release_days_ahead);
+        releaseDate.setHours(rParts[0], rParts[1], 0, 0);
+        return now < releaseDate;
+      });
+      const hasReleased = target_dates.some((d: string) => {
+        const target = new Date(d + "T00:00:00");
+        const rParts = (resolvedReleaseTime as string).split(":").map(Number);
+        const releaseDate = new Date(target);
+        releaseDate.setDate(releaseDate.getDate() - restaurant.release_days_ahead);
+        releaseDate.setHours(rParts[0], rParts[1], 0, 0);
+        return now >= releaseDate;
+      });
+
+      if (hasUnreleased) {
+        resolvedSnipe = true;
+      }
+      if (!hasReleased) {
+        resolvedMonitorCancellations = false;
+      }
+    }
+  }
+
   const { data, error } = await supabase
     .from("reservation_requests")
     .insert({
@@ -61,10 +106,10 @@ export async function POST(request: Request) {
       party_size: party_size || 2,
       target_dates,
       preferred_times,
-      monitor_cancellations: monitor_cancellations ?? true,
-      release_snipe: release_snipe ?? false,
-      release_time: release_time || null,
-      release_days_ahead: release_days_ahead || null,
+      monitor_cancellations: resolvedMonitorCancellations,
+      release_snipe: resolvedSnipe,
+      release_time: resolvedReleaseTime,
+      release_days_ahead: resolvedReleaseDaysAhead,
       status: "active",
     })
     .select()

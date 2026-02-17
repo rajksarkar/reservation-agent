@@ -172,6 +172,12 @@ class MultiUserOrchestrator:
 
             # Check each target date
             for target_date in request.get("target_dates", []):
+                # Skip dates whose slots haven't been released yet — the
+                # snipe scheduler will handle those.  Only poll for
+                # cancellations on dates that are already released.
+                if self._is_date_unreleased(target_date, restaurant):
+                    continue
+
                 start_time = datetime.now()
 
                 # OpenTable: single-page check+book avoids Firefox crash
@@ -668,6 +674,35 @@ class MultiUserOrchestrator:
             "snipe_booking_successful",
             confirmation=book_result.confirmation_number,
         )
+
+    @staticmethod
+    def _is_date_unreleased(target_date: str, restaurant: dict) -> bool:
+        """Return True if the restaurant hasn't released slots for target_date yet.
+
+        Uses the restaurant's release_days_ahead and release_time to compute
+        when slots for target_date become available.  If that moment is still
+        in the future, the date is unreleased and should not be polled for
+        cancellations (a snipe will handle it instead).
+        """
+        days_ahead = restaurant.get("release_days_ahead")
+        if not days_ahead:
+            return False  # no schedule info → assume released
+
+        release_time_str = restaurant.get("release_time") or "09:00"
+        # release_time may be "HH:MM" or "HH:MM:SS"
+        parts = release_time_str.split(":")
+        rh, rm = int(parts[0]), int(parts[1])
+
+        et = ZoneInfo("America/New_York")
+        now = datetime.now(tz=et)
+
+        target = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=et)
+        release_date = target - timedelta(days=days_ahead)
+        release_dt = release_date.replace(
+            hour=rh, minute=rm, second=0, microsecond=0
+        )
+
+        return now < release_dt
 
     async def _get_platform(self, user_id: str, platform_name: str) -> BasePlatform | None:
         """Get or create a platform instance for a user."""
