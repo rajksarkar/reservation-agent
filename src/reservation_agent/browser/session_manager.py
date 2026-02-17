@@ -92,9 +92,25 @@ class SessionManager:
         """Get or create a browser context for a platform."""
         async with self._lock:
             if platform in self._contexts:
-                return self._contexts[platform]
+                # Check if the context is still alive
+                try:
+                    # A quick probe — if context is closed, this raises
+                    _ = self._contexts[platform].pages
+                    return self._contexts[platform]
+                except Exception:
+                    logger.warning("stale_context_detected", platform=platform)
+                    del self._contexts[platform]
 
             browser_type = PLATFORM_BROWSER.get(platform, "chromium")
+
+            # Also check if the browser is still alive
+            if browser_type in self._browsers:
+                try:
+                    _ = self._browsers[browser_type].contexts
+                except Exception:
+                    logger.warning("stale_browser_detected", browser=browser_type)
+                    del self._browsers[browser_type]
+
             browser = await self._get_browser(browser_type)
 
             context = await self._create_context(platform, browser)
