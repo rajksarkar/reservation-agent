@@ -92,35 +92,42 @@ class SessionManager:
         """Get or create a browser context for a platform."""
         async with self._lock:
             if platform in self._contexts:
-                # Check if the context is still alive
-                try:
-                    # A quick probe — if context is closed, this raises
-                    _ = self._contexts[platform].pages
-                    return self._contexts[platform]
-                except Exception:
-                    logger.warning("stale_context_detected", platform=platform)
-                    del self._contexts[platform]
+                return self._contexts[platform]
 
-            browser_type = PLATFORM_BROWSER.get(platform, "chromium")
+            return await self._create_fresh_context(platform)
 
-            # Also check if the browser is still alive
-            if browser_type in self._browsers:
-                try:
-                    _ = self._browsers[browser_type].contexts
-                except Exception:
-                    logger.warning("stale_browser_detected", browser=browser_type)
-                    del self._browsers[browser_type]
+    async def _create_fresh_context(self, platform: str) -> BrowserContext:
+        """Create a fresh browser context for a platform (caller must hold _lock)."""
+        browser_type = PLATFORM_BROWSER.get(platform, "chromium")
 
+        try:
             browser = await self._get_browser(browser_type)
-
             context = await self._create_context(platform, browser)
-            self._contexts[platform] = context
-            return context
+        except Exception:
+            # Browser may have died — discard it and relaunch
+            logger.warning("browser_dead_relaunching", browser=browser_type)
+            self._browsers.pop(browser_type, None)
+            browser = await self._get_browser(browser_type)
+            context = await self._create_context(platform, browser)
+
+        self._contexts[platform] = context
+        return context
 
     async def get_page(self, platform: str) -> Page:
-        """Get a new page in the platform's context."""
+        """Get a new page in the platform's context.
+
+        If context.new_page() fails (stale/dead context), the cached context
+        is discarded and a fresh one is created before retrying.
+        """
         context = await self.get_context(platform)
-        page = await context.new_page()
+        try:
+            page = await context.new_page()
+        except Exception:
+            logger.warning("stale_context_detected_on_new_page", platform=platform)
+            async with self._lock:
+                self._contexts.pop(platform, None)
+                context = await self._create_fresh_context(platform)
+            page = await context.new_page()
         page.set_default_timeout(self.config.timeout)
         return page
 
