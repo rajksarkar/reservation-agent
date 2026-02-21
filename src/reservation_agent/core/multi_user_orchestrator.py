@@ -124,10 +124,19 @@ class MultiUserOrchestrator:
         if not cancellation_requests:
             return
 
-        # Process requests concurrently (limited concurrency)
-        sem = asyncio.Semaphore(3)
+        # Process requests concurrently with per-platform limits.
+        # OpenTable uses a single shared Firefox process — running multiple
+        # requests concurrently crashes the browser for all of them.
+        # Resy/Tock use Chromium which handles concurrency fine.
+        platform_sems: dict[str, asyncio.Semaphore] = {
+            "opentable": asyncio.Semaphore(1),
+            "resy": asyncio.Semaphore(2),
+            "tock": asyncio.Semaphore(2),
+        }
 
         async def process_with_sem(req: dict) -> None:
+            platform = req.get("restaurants", {}).get("platform", "")
+            sem = platform_sems.get(platform, asyncio.Semaphore(1))
             async with sem:
                 await self._process_request(req)
 
