@@ -218,6 +218,22 @@ class SessionManager:
         age_seconds = time.time() - session_file.stat().st_mtime
         return age_seconds < max_age_hours * 3600
 
+    async def reset_context(self, platform: str) -> None:
+        """Close and discard the current browser context without removing the session file.
+
+        Use this when the context has crashed mid-operation.  The next call to
+        get_page() will create a fresh context and reload cookies from the
+        existing session file.
+        """
+        async with self._lock:
+            old_ctx = self._contexts.pop(platform, None)
+            if old_ctx:
+                try:
+                    await old_ctx.close()
+                except Exception:
+                    pass
+        logger.info("reset_context", platform=platform)
+
     async def clear_session(self, platform: str) -> None:
         """Clear saved session for a platform."""
         async with self._lock:

@@ -30,6 +30,15 @@ logger = get_logger(__name__)
 
 POLL_INTERVAL = 30  # seconds
 
+# Backoff constants for repeated platform failures
+_MAX_NAV_FAILURES = 5     # consecutive nav timeouts before cooldown
+_COOLDOWN_MINUTES = 10    # minutes to pause a request after repeated failures
+_BROWSER_CRASH_MSGS = (
+    "Target page, context or browser has been closed",
+    "Browser has been closed",
+    "context has been closed",
+)
+
 
 class MultiUserOrchestrator:
     """Processes reservation requests from multiple users via Supabase."""
@@ -54,6 +63,10 @@ class MultiUserOrchestrator:
         # Snipe scheduling state
         self._scheduled_snipes: set[str] = set()  # "requestId_targetDate" keys already scheduled
         self._active_snipe_requests: set[str] = set()  # request IDs currently being sniped
+
+        # Per-request failure tracking for backoff
+        self._nav_failure_counts: dict[str, int] = {}   # request_id → consecutive nav timeouts
+        self._cooldown_until: dict[str, datetime] = {}  # request_id → resume datetime
 
     async def start(self) -> None:
         """Initialize browser session manager."""
@@ -129,6 +142,20 @@ class MultiUserOrchestrator:
             user_id=user_id[:8],
             restaurant=restaurant.get("name", "unknown"),
         ):
+            # Skip requests that are cooling down after repeated failures
+            now_dt = datetime.now()
+            if request_id in self._cooldown_until:
+                if now_dt < self._cooldown_until[request_id]:
+                    remaining = int(
+                        (self._cooldown_until[request_id] - now_dt).total_seconds() // 60
+                    )
+                    logger.info("request_in_cooldown", remaining_minutes=remaining)
+                    return
+                else:
+                    del self._cooldown_until[request_id]
+                    self._nav_failure_counts.pop(request_id, None)
+                    logger.info("cooldown_expired_resuming")
+
             # Get or create platform instance for this user
             platform = await self._get_platform(user_id, platform_name)
             if not platform:
@@ -554,6 +581,8 @@ class MultiUserOrchestrator:
             return False
 
         if book_result is None:
+            # Successful check, just no slots — reset failure streak
+            self._nav_failure_counts.pop(request_id, None)
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
             self.repo.log_attempt(
                 request_id=request_id,
@@ -566,6 +595,8 @@ class MultiUserOrchestrator:
         duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
         if book_result.success:
+            # Successful booking — reset failure streak
+            self._nav_failure_counts.pop(request_id, None)
             self.repo.update_request_status(
                 request_id=request_id,
                 status="booked",
@@ -590,10 +621,46 @@ class MultiUserOrchestrator:
             logger.info("booking_successful", confirmation=book_result.confirmation_number)
             return True
 
+        # check_and_book returned a failure — classify the error
+        error_msg = book_result.error_message or ""
+        is_browser_crash = any(s in error_msg for s in _BROWSER_CRASH_MSGS)
+        is_nav_timeout = "Timeout" in error_msg
+
+        if is_browser_crash:
+            # Context died mid-operation — reset it so the next poll gets a fresh one
+            logger.warning("browser_crash_resetting_context", date=target_date)
+            if self.session_manager:
+                await self.session_manager.reset_context("opentable")
+            result_label = "error"
+        elif is_nav_timeout:
+            # Navigation timeout — likely rate-limited; count toward cooldown
+            count = self._nav_failure_counts.get(request_id, 0) + 1
+            self._nav_failure_counts[request_id] = count
+            logger.warning(
+                "nav_timeout_failure",
+                count=count,
+                max=_MAX_NAV_FAILURES,
+                date=target_date,
+            )
+            if count >= _MAX_NAV_FAILURES:
+                cooldown_until = datetime.now() + timedelta(minutes=_COOLDOWN_MINUTES)
+                self._cooldown_until[request_id] = cooldown_until
+                self._nav_failure_counts.pop(request_id, None)
+                logger.warning(
+                    "request_entering_cooldown",
+                    cooldown_minutes=_COOLDOWN_MINUTES,
+                    cooldown_until=cooldown_until.isoformat(),
+                )
+            result_label = "error"
+        else:
+            # Slot taken or other transient booking failure — reset streak
+            self._nav_failure_counts.pop(request_id, None)
+            result_label = "slot_taken"
+
         self.repo.log_attempt(
             request_id=request_id,
             attempt_type="cancellation_check",
-            result="slot_taken",
+            result=result_label,
             slot_time=slot.time if slot else None,
             error_message=book_result.error_message,
             duration_ms=duration_ms,
