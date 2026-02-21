@@ -851,6 +851,19 @@ class OpenTablePlatform(BasePlatform):
         """Click 'Complete Reservation' and verify confirmation."""
         self.logger.info("looking_for_complete_button", url=page.url)
 
+        # Fill phone number if the booking/details form requires it
+        phone = (self.credentials or {}).get("phone") if isinstance(self.credentials, dict) else None
+        if phone:
+            try:
+                phone_input = await page.query_selector('input[type="tel"], input[name*="phone"], input[placeholder*="phone" i]')
+                if phone_input:
+                    current = await phone_input.input_value()
+                    if not current:
+                        await phone_input.fill(phone)
+                        self.logger.info("filled_phone_number")
+            except Exception as e:
+                self.logger.warning("phone_fill_failed", error=str(e))
+
         complete_clicked = False
         for sel in [
             self.SELECTORS["complete_reservation"],

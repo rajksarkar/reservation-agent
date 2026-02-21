@@ -848,13 +848,20 @@ class MultiUserOrchestrator:
                 logger.error("credential_decryption_failed", error=str(e))
                 return None
 
+        # Include phone number from the user's profile (used for OT booking/details form)
+        phone = self.repo.get_user_phone(user_id)
+
         credentials = None
         if username and password:
             credentials = {
                 "platform": platform_name,
                 "username": username,
                 "password": password,
+                "phone": phone,
             }
+        elif phone:
+            # Session-only path: no decrypted credentials but we have a phone
+            credentials = {"platform": platform_name, "username": "", "password": "", "phone": phone}
 
         # Create platform with a browser context scoped to this user
         platform = platform_class(self.session_manager, credentials)

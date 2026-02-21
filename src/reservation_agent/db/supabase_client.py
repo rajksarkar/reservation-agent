@@ -63,6 +63,19 @@ class SupabaseRepository:
         )
         return result.data or []
 
+    def get_user_phone(self, user_id: str) -> str | None:
+        """Fetch phone number from the user's profile."""
+        result = (
+            self.client.table("profiles")
+            .select("phone")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0].get("phone")
+        return None
+
     def get_user_platform_account(self, user_id: str, platform: str) -> dict | None:
         """Fetch encrypted credentials for a user+platform."""
         result = (
