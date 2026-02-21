@@ -130,7 +130,7 @@ class OpenTablePlatform(BasePlatform):
         try:
             # Block heavy resources to reduce memory pressure in the Railway container
             await page.route(
-                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg}",
+                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg,css}",
                 lambda route: route.abort(),
             )
 
@@ -549,7 +549,7 @@ class OpenTablePlatform(BasePlatform):
         try:
             # Block heavy resources to reduce memory pressure in the Railway container
             await page.route(
-                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg}",
+                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg,css}",
                 lambda route: route.abort(),
             )
 

@@ -655,6 +655,9 @@ class MultiUserOrchestrator:
             )
             if self.session_manager:
                 await self.session_manager.reset_context("opentable")
+            # Give Firefox time to fully stabilize after a crash/relaunch
+            # before the next request can grab the shared browser.
+            await asyncio.sleep(5)
             # After 3 consecutive crashes, enter a 5-minute cooldown to stop
             # hammering Railway with Firefox relaunches
             if crash_count >= 3:
