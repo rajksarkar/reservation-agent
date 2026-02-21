@@ -38,6 +38,11 @@ _BROWSER_CRASH_MSGS = (
     "Browser has been closed",
     "context has been closed",
 )
+_FIREFOX_NET_ERRORS = (
+    "NS_ERROR_NET_INTERRUPT",
+    "NS_BINDING_ABORTED",
+    "NS_ERROR_NET_RESET",
+)
 
 
 class MultiUserOrchestrator:
@@ -628,6 +633,7 @@ class MultiUserOrchestrator:
         error_msg = book_result.error_message or ""
         is_browser_crash = any(s in error_msg for s in _BROWSER_CRASH_MSGS)
         is_nav_timeout = "Timeout" in error_msg
+        is_firefox_net_error = any(s in error_msg for s in _FIREFOX_NET_ERRORS)
 
         if is_browser_crash:
             # Context died mid-operation — reset it so the next poll gets a fresh one
@@ -652,15 +658,16 @@ class MultiUserOrchestrator:
                     cooldown_until=cooldown_until.isoformat(),
                 )
             result_label = "error"
-        elif is_nav_timeout:
-            # Navigation timeout — likely rate-limited; count toward cooldown
+        elif is_nav_timeout or is_firefox_net_error:
+            # Navigation timeout or Firefox network error — count toward cooldown
             count = self._nav_failure_counts.get(request_id, 0) + 1
             self._nav_failure_counts[request_id] = count
             logger.warning(
-                "nav_timeout_failure",
+                "nav_failure",
                 count=count,
                 max=_MAX_NAV_FAILURES,
                 date=target_date,
+                error=error_msg[:80],
             )
             if count >= _MAX_NAV_FAILURES:
                 cooldown_until = datetime.now() + timedelta(minutes=_COOLDOWN_MINUTES)
@@ -672,8 +679,12 @@ class MultiUserOrchestrator:
                     cooldown_until=cooldown_until.isoformat(),
                 )
             result_label = "error"
+        elif slot is None:
+            # Navigation or setup failed before any slot was found — not a real slot_taken
+            self._nav_failure_counts.pop(request_id, None)
+            result_label = "error"
         else:
-            # Slot taken or other transient booking failure — reset streak
+            # Slot was found and clicked but booking failed (true slot_taken) — reset streak
             self._nav_failure_counts.pop(request_id, None)
             result_label = "slot_taken"
 
