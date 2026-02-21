@@ -646,6 +646,30 @@ class OpenTablePlatform(BasePlatform):
 
             self.logger.info("check_and_book_post_click", url=page.url)
 
+            # ---- 4b. Swap to a fresh page to free Firefox memory ----
+            # The slot click navigates to a heavy booking page (seating-options,
+            # etc.).  Keeping the restaurant page's JS heap alive while loading
+            # that second page causes OOM on Railway.  Close the current page
+            # and reopen a fresh one; the booking URL is self-contained so the
+            # same session cookies are enough to resume the flow.
+            booking_url = page.url
+            await page.close()
+            page = await self.get_page(force_new=True)
+            helper = PageHelper(page)
+            await page.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg,css}",
+                lambda route: route.abort(),
+            )
+            if "/booking/" in booking_url or "seating-options" in booking_url:
+                try:
+                    await page.goto(
+                        booking_url, wait_until="domcontentloaded", timeout=30000
+                    )
+                    await asyncio.sleep(1)
+                    self.logger.info("reopened_booking_page", url=booking_url[:80])
+                except Exception as e:
+                    self.logger.warning("reopen_booking_nav_error", error=str(e))
+
             # ---- 5. Handle seating options (prefer non-outdoor) ----
             await self._handle_seating_options(page)
 
