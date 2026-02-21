@@ -51,6 +51,15 @@ class SessionManager:
             self._browsers["firefox"] = await self._playwright.firefox.launch(
                 headless=self.config.headless,
                 slow_mo=self.config.slow_mo,
+                firefox_user_prefs={
+                    # Reduce memory usage in constrained Railway containers
+                    "browser.cache.disk.enable": False,
+                    "browser.cache.memory.capacity": 32768,  # 32 MB cache cap
+                    "browser.sessionhistory.max_total_viewers": 0,  # No back/forward cache
+                    "dom.ipc.processCount.web": 1,  # Single web content process
+                    "media.autoplay.enabled": False,
+                    "browser.tabs.unloadOnLowMemory": True,
+                },
             )
         else:
             self._browsers["chromium"] = await self._playwright.chromium.launch(

@@ -128,6 +128,12 @@ class OpenTablePlatform(BasePlatform):
         interceptor = None
 
         try:
+            # Block heavy resources to reduce memory pressure in the Railway container
+            await page.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg}",
+                lambda route: route.abort(),
+            )
+
             # Retry navigation up to 3 times
             max_retries = 3
             last_error = None
@@ -541,6 +547,12 @@ class OpenTablePlatform(BasePlatform):
         interceptor = None
 
         try:
+            # Block heavy resources to reduce memory pressure in the Railway container
+            await page.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,mp4,webm,mp3,ogg}",
+                lambda route: route.abort(),
+            )
+
             # ---- 1. Navigate to restaurant page ----
             max_retries = 3
             last_error = None

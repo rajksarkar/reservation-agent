@@ -66,6 +66,7 @@ class MultiUserOrchestrator:
 
         # Per-request failure tracking for backoff
         self._nav_failure_counts: dict[str, int] = {}   # request_id → consecutive nav timeouts
+        self._crash_failure_counts: dict[str, int] = {}  # request_id → consecutive browser crashes
         self._cooldown_until: dict[str, datetime] = {}  # request_id → resume datetime
 
     async def start(self) -> None:
@@ -581,8 +582,9 @@ class MultiUserOrchestrator:
             return False
 
         if book_result is None:
-            # Successful check, just no slots — reset failure streak
+            # Successful check, just no slots — reset failure streaks
             self._nav_failure_counts.pop(request_id, None)
+            self._crash_failure_counts.pop(request_id, None)
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
             self.repo.log_attempt(
                 request_id=request_id,
@@ -595,8 +597,9 @@ class MultiUserOrchestrator:
         duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
         if book_result.success:
-            # Successful booking — reset failure streak
+            # Successful booking — reset failure streaks
             self._nav_failure_counts.pop(request_id, None)
+            self._crash_failure_counts.pop(request_id, None)
             self.repo.update_request_status(
                 request_id=request_id,
                 status="booked",
@@ -628,9 +631,26 @@ class MultiUserOrchestrator:
 
         if is_browser_crash:
             # Context died mid-operation — reset it so the next poll gets a fresh one
-            logger.warning("browser_crash_resetting_context", date=target_date)
+            crash_count = self._crash_failure_counts.get(request_id, 0) + 1
+            self._crash_failure_counts[request_id] = crash_count
+            logger.warning(
+                "browser_crash_resetting_context",
+                date=target_date,
+                crash_count=crash_count,
+            )
             if self.session_manager:
                 await self.session_manager.reset_context("opentable")
+            # After 3 consecutive crashes, enter a 5-minute cooldown to stop
+            # hammering Railway with Firefox relaunches
+            if crash_count >= 3:
+                cooldown_until = datetime.now() + timedelta(minutes=5)
+                self._cooldown_until[request_id] = cooldown_until
+                self._crash_failure_counts.pop(request_id, None)
+                logger.warning(
+                    "request_entering_crash_cooldown",
+                    cooldown_minutes=5,
+                    cooldown_until=cooldown_until.isoformat(),
+                )
             result_label = "error"
         elif is_nav_timeout:
             # Navigation timeout — likely rate-limited; count toward cooldown
