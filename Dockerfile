@@ -25,6 +25,9 @@ RUN pip install --no-cache-dir -e .
 # Install Playwright browsers (Chromium for Resy/Tock, Firefox for OpenTable)
 RUN playwright install chromium firefox
 
+# Reduce glibc malloc arena count to lower Firefox memory footprint in containers
+ENV MALLOC_ARENAS_MAX=2
+
 # Create writable dirs for sessions and logs
 RUN mkdir -p /tmp/sessions /tmp/logs
 

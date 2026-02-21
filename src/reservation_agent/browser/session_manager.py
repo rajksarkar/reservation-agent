@@ -54,11 +54,22 @@ class SessionManager:
                 firefox_user_prefs={
                     # Reduce memory usage in constrained Railway containers
                     "browser.cache.disk.enable": False,
-                    "browser.cache.memory.capacity": 32768,  # 32 MB cache cap
+                    "browser.cache.memory.capacity": 16384,  # 16 MB cache cap
                     "browser.sessionhistory.max_total_viewers": 0,  # No back/forward cache
                     "dom.ipc.processCount.web": 1,  # Single web content process
                     "media.autoplay.enabled": False,
                     "browser.tabs.unloadOnLowMemory": True,
+                    # Additional memory pressure reduction
+                    "javascript.options.mem.high_water_mark": 64,  # GC at 64 MB heap pressure
+                    "javascript.options.mem.max": 512,  # Hard JS heap cap (MB)
+                    "dom.serviceWorkers.enabled": False,  # No service worker background threads
+                    "dom.push.enabled": False,
+                    "permissions.default.image": 2,  # Block all images at the browser level
+                    "layers.acceleration.disabled": True,  # No GPU compositing
+                    "gfx.webrender.all": False,  # Disable WebRender
+                    "gfx.canvas.remote": False,  # No remote canvas process
+                    "network.prefetch-next": False,  # No speculative fetching
+                    "network.preload": False,
                 },
             )
         else:
@@ -177,7 +188,7 @@ class SessionManager:
 
         context = await browser.new_context(
             storage_state=storage_state,
-            viewport={"width": 1920, "height": 1080},
+            viewport={"width": 1280, "height": 800} if is_firefox else {"width": 1920, "height": 1080},
             user_agent=user_agent,
             locale="en-US",
             timezone_id="America/New_York",

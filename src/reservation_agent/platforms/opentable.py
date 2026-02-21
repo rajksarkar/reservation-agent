@@ -271,7 +271,20 @@ class OpenTablePlatform(BasePlatform):
                     )
 
         except Exception as e:
-            self.logger.warning("dom_parse_error", error=str(e))
+            err_str = str(e)
+            # Re-raise browser/page crash errors so the orchestrator can reset the
+            # browser context.  Silently returning [] would mask the crash and leave
+            # Firefox in a dead state for subsequent requests.
+            if any(
+                s in err_str
+                for s in (
+                    "Target page, context or browser has been closed",
+                    "Browser has been closed",
+                    "context has been closed",
+                )
+            ):
+                raise
+            self.logger.warning("dom_parse_error", error=err_str)
         return slots
 
     async def book_slot(
