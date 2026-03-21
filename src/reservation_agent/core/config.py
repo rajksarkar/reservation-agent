@@ -92,7 +92,6 @@ class AgentConfig(BaseModel):
     restaurants: list[RestaurantConfig] = Field(default_factory=list)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
-    database_url: str = "sqlite+aiosqlite:///data/reservation_agent.db"
     log_level: str = "INFO"
     log_dir: str = "data/logs"
     dry_run: bool = False
@@ -127,8 +126,8 @@ def process_env_vars(obj):
     return obj
 
 
-def load_config(config_path: str | Path | None = None, allow_minimal: bool = False) -> AgentConfig:
-    """Load configuration from YAML file, or create minimal config from env vars."""
+def load_config(config_path: str | Path | None = None) -> AgentConfig:
+    """Load configuration from YAML file."""
     if config_path is None:
         # Look for config in standard locations
         search_paths = [
@@ -141,17 +140,6 @@ def load_config(config_path: str | Path | None = None, allow_minimal: bool = Fal
                 config_path = path
                 break
         else:
-            if allow_minimal:
-                # Worker mode: create config from environment variables
-                return AgentConfig(
-                    browser=BrowserConfig(
-                        headless=True,
-                        sessions_dir=os.environ.get("SESSIONS_DIR", "/tmp/sessions"),
-                    ),
-                    log_level=os.environ.get("LOG_LEVEL", "INFO"),
-                    log_dir=os.environ.get("LOG_DIR", "/tmp/logs"),
-                    dry_run=os.environ.get("DRY_RUN", "").lower() in ("true", "1"),
-                )
             raise FileNotFoundError(
                 "No configuration file found. Create config/config.yaml or specify path."
             )
